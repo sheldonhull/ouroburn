@@ -1,0 +1,28 @@
+amends "package://github.com/jdx/hk/releases/download/v1.0.0/hk@1.0.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.0.0/hk@1.0.0#/Builtins.pkl"
+
+`pre-commit` {
+    fix = true
+    stash = "git"
+    steps {
+        ["swiftformat"] {
+            glob = List("*.swift")
+            check = "swiftformat --lint {{files}}"
+            fix = "swiftformat {{files}}"
+        }
+        ["swiftlint"] {
+            glob = List("*.swift")
+            check = "swiftlint lint --quiet --strict {{files}}"
+        }
+        ["end-of-file-fixer"] = Builtins.end_of_file_fixer
+        ["trailing-whitespace"] = Builtins.trailing_whitespace
+    }
+}
+
+`pre-push` {
+    steps {
+        ["build"] {
+            check = "swift build -c release"
+        }
+    }
+}

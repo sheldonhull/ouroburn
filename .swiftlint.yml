@@ -1,0 +1,22 @@
+included:
+  - Sources
+  - Tests
+
+disabled_rules:
+  - todo
+  - line_length
+
+opt_in_rules:
+  - empty_count
+  - explicit_init
+  - first_where
+  - force_unwrapping
+  - implicit_return
+  - redundant_nil_coalescing
+
+identifier_name:
+  min_length: 2
+  excluded:
+    - id
+    - x
+    - y

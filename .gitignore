@@ -1,0 +1,24 @@
+# Swift / SwiftPM
+.build/
+.swiftpm/
+Packages/
+*.xcodeproj
+DerivedData/
+.netrc
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Mise / hk caches
+.mise.local.toml
+.hk/
+
+# Local cache (ccusage clone for reference)
+.cache/
+
+# Logs
+*.log
