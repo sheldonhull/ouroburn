@@ -4,6 +4,8 @@ import AppKit
 final class StatusBarController {
     var onShowSettings: (() -> Void)?
     var onRevealLogs: (() -> Void)?
+    var onLoginRequested: (() -> Void)?
+    var onShowSpendHistory: (() -> Void)?
 
     private let item: NSStatusItem
     private let iconView: OuroborosView
@@ -27,7 +29,7 @@ final class StatusBarController {
                 iconView.centerXAnchor.constraint(equalTo: button.centerXAnchor),
                 iconView.centerYAnchor.constraint(equalTo: button.centerYAnchor),
                 iconView.widthAnchor.constraint(equalToConstant: 22),
-                iconView.heightAnchor.constraint(equalToConstant: 22),
+                iconView.heightAnchor.constraint(equalToConstant: 22)
             ])
         }
 
@@ -37,6 +39,15 @@ final class StatusBarController {
         popover.contentViewController = metrics
 
         metrics.onModeChange = { [weak tracker] mode in tracker?.setMode(mode) }
+        metrics.onLoginClick = { [weak self] in self?.onLoginRequested?() }
+        metrics.onMonthlyTileClick = { [weak self] in self?.onShowSpendHistory?() }
+        metrics.setConnectionState(
+            OAuthCredentialStore.load() != nil ? .connected(spendUSD: nil) : .disconnected
+        )
+    }
+
+    func setConnectionState(_ state: MetricsViewController.ConnectionState) {
+        metrics.setConnectionState(state)
     }
 
     func render(snapshot: TrackerSnapshot) {
@@ -86,12 +97,30 @@ final class StatusBarController {
     private func buildContextMenu() -> NSMenu {
         let menu = NSMenu()
         menu.addItem(makeMenuItem(title: "Open ouroburn", symbol: "flame", action: #selector(openPopover(_:))))
+        menu.addItem(makeMenuItem(
+            title: "Refresh now",
+            symbol: "arrow.clockwise",
+            action: #selector(refreshNow(_:))
+        ))
         menu.addItem(.separator())
         menu.addItem(makeMenuItem(title: "Settings…", symbol: "gearshape", action: #selector(openSettings(_:))))
-        menu.addItem(makeMenuItem(title: "Reveal logs in Finder", symbol: "doc.text.magnifyingglass", action: #selector(revealLogs(_:))))
+        menu.addItem(makeMenuItem(
+            title: "Reveal logs in Finder",
+            symbol: "doc.text.magnifyingglass",
+            action: #selector(revealLogs(_:))
+        ))
         menu.addItem(.separator())
-        menu.addItem(makeMenuItem(title: "Quit ouroburn", symbol: "power", action: #selector(NSApplication.terminate(_:))))
+        menu.addItem(makeMenuItem(
+            title: "Quit ouroburn",
+            symbol: "power",
+            action: #selector(NSApplication.terminate(_:))
+        ))
         return menu
+    }
+
+    @objc private func refreshNow(_: Any?) {
+        Log.info(Log.ui, "Refresh now menu item triggered")
+        tracker.forceRefresh()
     }
 
     private func makeMenuItem(title: String, symbol: String, action: Selector) -> NSMenuItem {
@@ -104,11 +133,17 @@ final class StatusBarController {
         return item
     }
 
-    @objc private func openPopover(_: Any?) { togglePopover() }
+    @objc private func openPopover(_: Any?) {
+        togglePopover()
+    }
+
     @objc private func openSettings(_: Any?) {
         Log.info(Log.ui, "openSettings menu item triggered")
         if popover.isShown { popover.performClose(nil) }
         onShowSettings?()
     }
-    @objc private func revealLogs(_: Any?) { onRevealLogs?() }
+
+    @objc private func revealLogs(_: Any?) {
+        onRevealLogs?()
+    }
 }

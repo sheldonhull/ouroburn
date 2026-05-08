@@ -88,5 +88,7 @@ final class FileSink: @unchecked Sendable {
         }
     }
 
-    var location: URL { url }
+    var location: URL {
+        url
+    }
 }

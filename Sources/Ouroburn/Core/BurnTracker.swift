@@ -47,12 +47,27 @@ struct TrackerSnapshot: Sendable {
     /// `ANTHROPIC_ADMIN_API_KEY` and a successful fetch has occurred.
     let billedMonthUSD: Double?
 
-    var buckets: [AggregateBucket] { bucketsByMode[mode] ?? [] }
-    var timeline: [TimelinePoint] { timelinesByMode[mode] ?? [] }
-    var totalTokens: Int { buckets.reduce(0) { $0 + $1.totalTokens } }
-    var totalCostUSD: Double { buckets.reduce(0.0) { $0 + $1.costUSD } }
+    /// Human-readable status surfaced when the billing fetch can't currently produce a fresh
+    /// dollar value (rate-limited, unauthorized, transport error, …).
+    let billingStatusMessage: String?
 
-    func with(billedMonthUSD: Double?) -> TrackerSnapshot {
+    var buckets: [AggregateBucket] {
+        bucketsByMode[mode] ?? []
+    }
+
+    var timeline: [TimelinePoint] {
+        timelinesByMode[mode] ?? []
+    }
+
+    var totalTokens: Int {
+        buckets.reduce(0) { $0 + $1.totalTokens }
+    }
+
+    var totalCostUSD: Double {
+        buckets.reduce(0.0) { $0 + $1.costUSD }
+    }
+
+    func with(billedMonthUSD: Double?, billingStatusMessage: String? = nil) -> TrackerSnapshot {
         TrackerSnapshot(
             mode: mode,
             bucketsByMode: bucketsByMode,
@@ -70,7 +85,8 @@ struct TrackerSnapshot: Sendable {
             updatedAt: updatedAt,
             spikeDetected: spikeDetected,
             stale: stale,
-            billedMonthUSD: billedMonthUSD
+            billedMonthUSD: billedMonthUSD,
+            billingStatusMessage: billingStatusMessage
         )
     }
 }
@@ -85,6 +101,7 @@ final class BurnTracker: @unchecked Sendable {
 
     static let pollInterval: TimeInterval = 60
     static let burnWindowSeconds: TimeInterval = 5 * 60
+    static let billingTickInterval: TimeInterval = 30
     static let spikeMultiplierDefault: Double = 2.0
     static let spikeMinimumRateDefault: Double = 500
 
@@ -95,18 +112,22 @@ final class BurnTracker: @unchecked Sendable {
     private let queue = DispatchQueue(label: "ouroburn.burn-tracker", qos: .utility)
     private let state = OSAllocatedUnfairLock<State>(initialState: State())
     private var timer: DispatchSourceTimer?
+    private var billingTimer: DispatchSourceTimer?
 
     private struct State {
         var pricingTable: [String: ModelPricing] = [:]
         var activeMode: ViewMode = .day
         var previousRate: Double = 0
         var lastSnapshot: TrackerSnapshot?
-        // mtime-keyed cache: avoids reparsing files that haven't changed.
+        /// mtime-keyed cache: avoids reparsing files that haven't changed.
         var fileCache: [URL: CachedFile] = [:]
-        // Rolling rate samples used to compute a stable median (resists single-poll spikes).
+        /// Rolling rate samples used to compute a stable median (resists single-poll spikes).
         var rateHistory: [Double] = []
-        // Latest known admin-API billing total. Sticky between polls.
+        /// Latest known admin-API billing total. Sticky between polls.
         var billedMonthUSD: Double?
+        /// Latest billing status string surfaced into the popover footer (rate-limited, auth
+        /// failure, transport error, etc). Cleared on successful fetch.
+        var billingStatusMessage: String?
         // Tunable spike thresholds. Updated when the user saves settings.
         var spikeMultiplier: Double = BurnTracker.spikeMultiplierDefault
         var spikeMinimumRate: Double = BurnTracker.spikeMinimumRateDefault
@@ -116,6 +137,9 @@ final class BurnTracker: @unchecked Sendable {
         state.withLock {
             $0.spikeMultiplier = prefs.spikeMultiplier
             $0.spikeMinimumRate = prefs.spikeMinimumRate
+        }
+        if let billingService {
+            Task { await billingService.setPollInterval(minutes: prefs.oauthRefreshMinutes) }
         }
     }
 
@@ -147,28 +171,50 @@ final class BurnTracker: @unchecked Sendable {
 
     func bootstrapFromCache() -> TrackerSnapshot? {
         guard let cached = cache.load() else { return nil }
-        let buckets = cached.buckets.map { $0.toAggregateBucket() }
         let mode = ViewMode(rawValue: cached.mode) ?? .day
+
+        var bucketsByMode: [ViewMode: [AggregateBucket]] = [:]
+        if let map = cached.bucketsByMode {
+            for (key, buckets) in map {
+                guard let m = ViewMode(rawValue: key) else { continue }
+                bucketsByMode[m] = buckets.map { $0.toAggregateBucket() }
+            }
+        } else {
+            bucketsByMode[mode] = cached.buckets.map { $0.toAggregateBucket() }
+        }
+
+        var timelinesByMode: [ViewMode: [TimelinePoint]] = [:]
+        if let map = cached.timelinesByMode {
+            for (key, points) in map {
+                guard let m = ViewMode(rawValue: key) else { continue }
+                timelinesByMode[m] = points.map { $0.toTimelinePoint() }
+            }
+        }
+
         let snapshot = TrackerSnapshot(
             mode: mode,
-            bucketsByMode: [mode: buckets],
-            timelinesByMode: [:],
+            bucketsByMode: bucketsByMode,
+            timelinesByMode: timelinesByMode,
             tokensPerMinute: cached.burnRatePerMinute,
-            medianTokensPerMinute: cached.burnRatePerMinute,
+            medianTokensPerMinute: cached.medianTokensPerMinute ?? cached.burnRatePerMinute,
             previousTokensPerMinute: cached.burnRatePerMinute,
-            costPerHour: 0,
-            todayTokens: 0,
-            todayCostUSD: 0,
-            weekTokens: 0,
-            weekCostUSD: 0,
-            monthTokens: 0,
-            monthCostUSD: 0,
+            costPerHour: cached.costPerHour ?? 0,
+            todayTokens: cached.todayTokens ?? 0,
+            todayCostUSD: cached.todayCostUSD ?? 0,
+            weekTokens: cached.weekTokens ?? 0,
+            weekCostUSD: cached.weekCostUSD ?? 0,
+            monthTokens: cached.monthTokens ?? 0,
+            monthCostUSD: cached.monthCostUSD ?? 0,
             updatedAt: cached.savedAt,
             spikeDetected: cached.recentSpike,
             stale: true,
-            billedMonthUSD: nil
+            billedMonthUSD: cached.billedMonthUSD,
+            billingStatusMessage: nil
         )
-        state.withLock { $0.lastSnapshot = snapshot }
+        state.withLock {
+            $0.lastSnapshot = snapshot
+            $0.billedMonthUSD = cached.billedMonthUSD
+        }
         return snapshot
     }
 
@@ -180,6 +226,7 @@ final class BurnTracker: @unchecked Sendable {
             state.withLock { $0.pricingTable = table }
             Log.info(Log.tracker, "Pricing table loaded: \(table.count) models")
             queue.async { [weak self] in self?.poll() }
+            queue.async { [weak self] in self?.fetchBilling() }
         }
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -187,11 +234,59 @@ final class BurnTracker: @unchecked Sendable {
         timer.setEventHandler { [weak self] in self?.poll() }
         timer.resume()
         self.timer = timer
+
+        if billingService != nil {
+            let bt = DispatchSource.makeTimerSource(queue: queue)
+            // Independent billing tick. BillingService's own throttle gates the upstream HTTP
+            // call to the user-configured `oauthRefreshMinutes`; the per-minute fire here just
+            // ensures the credential refresh / status string surfaces promptly when the throttle
+            // window opens.
+            bt.schedule(deadline: .now() + Self.billingTickInterval, repeating: Self.billingTickInterval)
+            bt.setEventHandler { [weak self] in self?.fetchBilling() }
+            bt.resume()
+            billingTimer = bt
+        }
+    }
+
+    /// Force a poll right now and treat every JSONL on disk as stale so the file mtime cache is
+    /// rebuilt from scratch. Also clears the BillingService throttle so the next poll re-hits
+    /// `/api/oauth/usage`. Safe to call from any thread.
+    func forceRefresh() {
+        Log.info(Log.tracker, "Force refresh requested — clearing file cache + billing throttle")
+        state.withLock { $0.fileCache = [:] }
+        if let billingService {
+            Task { await billingService.invalidate() }
+        }
+        queue.async { [weak self] in self?.poll() }
+        queue.async { [weak self] in self?.fetchBilling() }
+    }
+
+    /// Async billing fetch decoupled from the session poll. Updates the snapshot in place so the
+    /// popover footer / monthly tile reflect upstream `extra_used_usd` independently of the
+    /// (much slower) JSONL aggregation cycle.
+    private func fetchBilling() {
+        guard let billingService else { return }
+        Task { [weak self] in
+            let total = await billingService.currentMonthBilledUSD()
+            let status = await billingService.currentStatusMessage()
+            guard let self else { return }
+            let updated = state.withLock { state -> TrackerSnapshot? in
+                state.billedMonthUSD = total
+                state.billingStatusMessage = status
+                guard let last = state.lastSnapshot else { return nil }
+                let next = last.with(billedMonthUSD: total, billingStatusMessage: status)
+                state.lastSnapshot = next
+                return next
+            }
+            if let updated { onUpdate?(updated) }
+        }
     }
 
     func stop() {
         timer?.cancel()
         timer = nil
+        billingTimer?.cancel()
+        billingTimer = nil
     }
 
     /// Load all entries, reparsing only files whose modification time differs from the cache.
@@ -260,9 +355,26 @@ final class BurnTracker: @unchecked Sendable {
     }
 
     private func poll() {
-        let (mode, table, previous, fileCacheSnapshot, history, spikeMultiplier, spikeMinimumRate) = state.withLock { state -> (ViewMode, [String: ModelPricing], Double, [URL: CachedFile], [Double], Double, Double) in
-            (state.activeMode, state.pricingTable, state.previousRate, state.fileCache, state.rateHistory, state.spikeMultiplier, state.spikeMinimumRate)
-        }
+        let (mode, table, previous, fileCacheSnapshot, history, spikeMultiplier, spikeMinimumRate) = state
+            .withLock { state -> (
+                ViewMode,
+                [String: ModelPricing],
+                Double,
+                [URL: CachedFile],
+                [Double],
+                Double,
+                Double
+            ) in
+                (
+                    state.activeMode,
+                    state.pricingTable,
+                    state.previousRate,
+                    state.fileCache,
+                    state.rateHistory,
+                    state.spikeMultiplier,
+                    state.spikeMinimumRate
+                )
+            }
 
         let isCold = fileCacheSnapshot.isEmpty
         let startMessage = isCold
@@ -272,7 +384,10 @@ final class BurnTracker: @unchecked Sendable {
 
         let now = Date()
         let (entries, updatedCache) = loadEntries(using: fileCacheSnapshot)
-        Log.info(Log.tracker, "Poll mode=\(mode.rawValue) entries=\(entries.count) cachedFiles=\(updatedCache.count) pricing=\(table.count)")
+        Log.info(
+            Log.tracker,
+            "Poll mode=\(mode.rawValue) entries=\(entries.count) cachedFiles=\(updatedCache.count) pricing=\(table.count)"
+        )
 
         let aggregator = Aggregator(pricing: table)
 
@@ -314,7 +429,9 @@ final class BurnTracker: @unchecked Sendable {
 
         let spike = previous > 0 && tokensPerMinute > previous * spikeMultiplier && tokensPerMinute > spikeMinimumRate
 
-        let billedSoFar = state.withLock { $0.billedMonthUSD }
+        let (billedSoFar, billingStatusSoFar) = state.withLock {
+            ($0.billedMonthUSD, $0.billingStatusMessage)
+        }
         let snapshot = TrackerSnapshot(
             mode: mode,
             bucketsByMode: bucketsByMode,
@@ -332,7 +449,8 @@ final class BurnTracker: @unchecked Sendable {
             updatedAt: now,
             spikeDetected: spike,
             stale: false,
-            billedMonthUSD: billedSoFar
+            billedMonthUSD: billedSoFar,
+            billingStatusMessage: billingStatusSoFar
         )
 
         state.withLock {
@@ -343,18 +461,54 @@ final class BurnTracker: @unchecked Sendable {
         }
 
         let activeBuckets = bucketsByMode[mode] ?? []
-        cache.save(CachedSnapshot(
+        var encodedBuckets: [String: [CachedSnapshot.CachedBucket]] = [:]
+        for (m, buckets) in bucketsByMode {
+            encodedBuckets[m.rawValue] = buckets.map(CachedSnapshot.CachedBucket.init)
+        }
+        var encodedTimelines: [String: [CachedSnapshot.CachedTimelinePoint]] = [:]
+        for (m, points) in timelinesByMode {
+            encodedTimelines[m.rawValue] = points.map(CachedSnapshot.CachedTimelinePoint.init)
+        }
+        let activeBucketSnapshots: [CachedSnapshot.CachedBucket] = activeBuckets
+            .map(CachedSnapshot.CachedBucket.init)
+        let todayTokens: Int = todayBucket?.totalTokens ?? 0
+        let todayCost: Double = todayBucket?.costUSD ?? 0
+        let weekTokens: Int = weekBucket?.totalTokens ?? 0
+        let weekCost: Double = weekBucket?.costUSD ?? 0
+        let monthTokens: Int = monthBucket?.totalTokens ?? 0
+        let monthCost: Double = monthBucket?.costUSD ?? 0
+        let cached = CachedSnapshot(
             savedAt: now,
-            buckets: activeBuckets.map(CachedSnapshot.CachedBucket.init),
+            buckets: activeBucketSnapshots,
             mode: mode.rawValue,
             burnRatePerMinute: tokensPerMinute,
-            recentSpike: spike
-        ))
+            recentSpike: spike,
+            bucketsByMode: encodedBuckets,
+            timelinesByMode: encodedTimelines,
+            medianTokensPerMinute: median,
+            costPerHour: costPerHour,
+            todayTokens: todayTokens,
+            todayCostUSD: todayCost,
+            weekTokens: weekTokens,
+            weekCostUSD: weekCost,
+            monthTokens: monthTokens,
+            monthCostUSD: monthCost,
+            billedMonthUSD: billedSoFar
+        )
+        cache.save(cached)
 
         let totalCost = activeBuckets.reduce(0.0) { $0 + $1.costUSD }
-        Log.info(Log.tracker,
-                 String(format: "Snapshot buckets=%d tok/min=%.1f $/hr=%.2f total$=%.2f spike=%@",
-                        activeBuckets.count, tokensPerMinute, costPerHour, totalCost, spike ? "YES" : "no"))
+        Log.info(
+            Log.tracker,
+            String(
+                format: "Snapshot buckets=%d tok/min=%.1f $/hr=%.2f total$=%.2f spike=%@",
+                activeBuckets.count,
+                tokensPerMinute,
+                costPerHour,
+                totalCost,
+                spike ? "YES" : "no"
+            )
+        )
 
         onUpdate?(snapshot)
         onRefreshStateChanged?(RefreshState(isRefreshing: false, message: ""))
@@ -363,21 +517,8 @@ final class BurnTracker: @unchecked Sendable {
             onSpike?(snapshot)
         }
 
-        // Optional admin-API billing fetch. Throttled to once per hour internally; this just
-        // kicks the actor and updates the snapshot whenever a fresh value arrives.
-        if let billingService {
-            Task { [weak self] in
-                let total = await billingService.currentMonthBilledUSD()
-                guard let self else { return }
-                let updated = state.withLock { state -> TrackerSnapshot? in
-                    state.billedMonthUSD = total
-                    guard let last = state.lastSnapshot else { return nil }
-                    let next = last.with(billedMonthUSD: total)
-                    state.lastSnapshot = next
-                    return next
-                }
-                if let updated { self.onUpdate?(updated) }
-            }
-        }
+        // Billing fetch runs on its own timer (see `billingTimer` / `fetchBilling`) so the
+        // OAuth call doesn't block on the JSONL aggregation cycle and surfaces refreshed
+        // numbers as soon as the throttle window opens.
     }
 }

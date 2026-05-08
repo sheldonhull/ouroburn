@@ -7,12 +7,17 @@ struct Preferences: Sendable {
     var spikeMinimumRate: Double
     var defaultMode: ViewMode
     var notificationCooldownSeconds: Double
+    /// Baseline interval (minutes) between Anthropic OAuth spend pulls. Floors at 1, ceilings at
+    /// 60. Failed fetches escalate up to `oauthRefreshMaxMinutes` via exponential backoff.
+    var oauthRefreshMinutes: Double
+    static let oauthRefreshMaxMinutes: Double = 15
 
     static let `default` = Preferences(
         spikeMultiplier: 2.0,
         spikeMinimumRate: 500,
         defaultMode: .day,
-        notificationCooldownSeconds: 600
+        notificationCooldownSeconds: 600,
+        oauthRefreshMinutes: 5
     )
 }
 
@@ -24,6 +29,7 @@ enum PreferencesStore {
         static let spikeMinimumRate = "ouroburn.spikeMinimumRate"
         static let defaultMode = "ouroburn.defaultMode"
         static let notificationCooldown = "ouroburn.notificationCooldown"
+        static let oauthRefreshMinutes = "ouroburn.oauthRefreshMinutes"
     }
 
     static func load() -> Preferences {
@@ -35,11 +41,15 @@ enum PreferencesStore {
             prefs.spikeMinimumRate = defaults.double(forKey: Key.spikeMinimumRate)
         }
         if let raw = defaults.string(forKey: Key.defaultMode),
-           let mode = ViewMode(rawValue: raw) {
+           let mode = ViewMode(rawValue: raw)
+        {
             prefs.defaultMode = mode
         }
         if defaults.object(forKey: Key.notificationCooldown) != nil {
             prefs.notificationCooldownSeconds = defaults.double(forKey: Key.notificationCooldown)
+        }
+        if defaults.object(forKey: Key.oauthRefreshMinutes) != nil {
+            prefs.oauthRefreshMinutes = defaults.double(forKey: Key.oauthRefreshMinutes)
         }
         return prefs
     }
@@ -49,10 +59,14 @@ enum PreferencesStore {
         defaults.set(prefs.spikeMinimumRate, forKey: Key.spikeMinimumRate)
         defaults.set(prefs.defaultMode.rawValue, forKey: Key.defaultMode)
         defaults.set(prefs.notificationCooldownSeconds, forKey: Key.notificationCooldown)
+        defaults.set(prefs.oauthRefreshMinutes, forKey: Key.oauthRefreshMinutes)
     }
 }
 
 enum SecretsAccount {
     static let claudeOAuth = "claude_oauth_token"
     static let anthropicAdmin = "anthropic_admin_api_key"
+    /// JSON envelope for Ouroburn's own PKCE-managed Claude OAuth credential
+    /// (`{accessToken, refreshToken, expiresAt}`). Owned by `OAuthCredentialStore`.
+    static let ouroburnOAuth = "ouroburn_oauth_credential"
 }

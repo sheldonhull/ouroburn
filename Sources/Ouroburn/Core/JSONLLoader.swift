@@ -116,7 +116,7 @@ struct JSONLLoader {
         return out
     }
 
-    func parseLine<S: StringProtocol>(_ raw: S, project: String, session: String) -> UsageEntry? {
+    func parseLine(_ raw: some StringProtocol, project: String, session: String) -> UsageEntry? {
         guard let data = raw.data(using: .utf8) else { return nil }
         guard let line = try? JSONDecoder().decode(RawLine.self, from: data) else { return nil }
         guard let timestamp = line.parsedTimestamp,
@@ -185,13 +185,13 @@ private struct RawLine: Decodable {
 }
 
 enum ISO8601 {
-    nonisolated(unsafe) private static let withFraction: ISO8601DateFormatter = {
+    private nonisolated(unsafe) static let withFraction: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
 
-    nonisolated(unsafe) private static let plain: ISO8601DateFormatter = {
+    private nonisolated(unsafe) static let plain: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f

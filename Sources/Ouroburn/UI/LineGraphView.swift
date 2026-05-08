@@ -2,10 +2,16 @@ import AppKit
 
 /// Activity-over-time line graph for the popover. Hover snaps to the nearest data point and
 /// shows a tooltip overlay with the bucket label, token count, cost, and the dominant session.
+enum LineGraphMetric {
+    case tokens
+    case cost
+}
+
 @MainActor
 final class LineGraphView: NSView {
     private var points: [TimelinePoint] = []
     private var accentColor: NSColor = Theme.accentBlue
+    private var metric: LineGraphMetric = .tokens
     private var trackingArea: NSTrackingArea?
     private var hoveredIndex: Int?
     private let tooltip = TooltipView()
@@ -31,11 +37,14 @@ final class LineGraphView: NSView {
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
-    func update(points: [TimelinePoint], accent: NSColor) {
+    func update(points: [TimelinePoint], accent: NSColor, metric: LineGraphMetric = .tokens) {
         self.points = points
-        self.accentColor = accent
+        accentColor = accent
+        self.metric = metric
         hoveredIndex = nil
         tooltip.isHidden = true
         needsDisplay = true
@@ -106,16 +115,27 @@ final class LineGraphView: NSView {
 
     private func pointPosition(at index: Int) -> CGPoint {
         let plotRect = plotArea()
-        let max = maxTokens()
-        let normalized = max > 0 ? CGFloat(points[index].tokens) / CGFloat(max) : 0
+        let value = metricValue(at: index)
+        let peak = peakMetric()
+        let normalized = peak > 0 ? CGFloat(value / peak) : 0
         let stride = plotRect.width / CGFloat(Swift.max(points.count - 1, 1))
         let x = plotRect.minX + stride * CGFloat(index)
         let y = plotRect.minY + (plotRect.height - 18) * normalized + 4
         return CGPoint(x: x, y: y)
     }
 
-    private func maxTokens() -> Int {
-        points.map(\.tokens).max() ?? 0
+    private func metricValue(at index: Int) -> Double {
+        switch metric {
+        case .tokens: Double(points[index].tokens)
+        case .cost: points[index].costUSD
+        }
+    }
+
+    private func peakMetric() -> Double {
+        switch metric {
+        case .tokens: Double(points.map(\.tokens).max() ?? 0)
+        case .cost: points.map(\.costUSD).max() ?? 0
+        }
     }
 
     private func drawGrid(in ctx: CGContext, rect: NSRect) {
@@ -124,7 +144,7 @@ final class LineGraphView: NSView {
         ctx.setLineWidth(0.5)
         ctx.setLineDash(phase: 0, lengths: [2, 3])
         let rows = 3
-        for i in 0...rows {
+        for i in 0 ... rows {
             let y = rect.minY + CGFloat(i) * (rect.height - 12) / CGFloat(rows) + 4
             ctx.move(to: CGPoint(x: rect.minX, y: y))
             ctx.addLine(to: CGPoint(x: rect.maxX, y: y))
@@ -136,13 +156,12 @@ final class LineGraphView: NSView {
     private func drawEmptyMessage(in ctx: CGContext, rect: NSRect) {
         let attrs: [NSAttributedString.Key: Any] = [
             .font: Theme.bodyFont(size: 11),
-            .foregroundColor: Theme.textTertiary,
+            .foregroundColor: Theme.textTertiary
         ]
-        let label: String
-        if points.isEmpty {
-            label = "No timeline data for this view."
+        let label = if points.isEmpty {
+            "No timeline data for this view."
         } else {
-            label = "Empty timeline."
+            "Empty timeline."
         }
         let attributed = NSAttributedString(string: label, attributes: attrs)
         let size = attributed.size()
@@ -155,10 +174,13 @@ final class LineGraphView: NSView {
         guard points.count > 1 else { return }
         let attrs: [NSAttributedString.Key: Any] = [
             .font: Theme.bodyFont(size: 9),
-            .foregroundColor: Theme.textTertiary,
+            .foregroundColor: Theme.textTertiary
         ]
-        let max = maxTokens()
-        let maxLabel = "\(BurnFormatting.compactTokens(max)) TK"
+        let peak = peakMetric()
+        let maxLabel = switch metric {
+        case .tokens: "\(BurnFormatting.compactTokens(Int(peak))) TK"
+        case .cost: String(format: "$%.2f", peak)
+        }
         NSAttributedString(string: maxLabel, attributes: attrs).draw(at: CGPoint(x: rect.minX, y: rect.maxY - 2))
 
         let firstStr = NSAttributedString(string: points.first?.label ?? "", attributes: attrs)
@@ -170,12 +192,14 @@ final class LineGraphView: NSView {
 
     private func drawLine(in ctx: CGContext, rect: NSRect) {
         guard points.count > 1 else { return }
-        let positions = (0..<points.count).map { pointPosition(at: $0) }
+        let positions = (0 ..< points.count).map { pointPosition(at: $0) }
 
         // Filled gradient under the line
         let fillPath = CGMutablePath()
         fillPath.move(to: CGPoint(x: positions.first!.x, y: rect.minY))
-        for p in positions { fillPath.addLine(to: p) }
+        for p in positions {
+            fillPath.addLine(to: p)
+        }
         fillPath.addLine(to: CGPoint(x: positions.last!.x, y: rect.minY))
         fillPath.closeSubpath()
         ctx.saveGState()
@@ -183,7 +207,7 @@ final class LineGraphView: NSView {
         ctx.clip()
         let colors = [
             accentColor.withAlphaComponent(0.45).cgColor,
-            accentColor.withAlphaComponent(0.05).cgColor,
+            accentColor.withAlphaComponent(0.05).cgColor
         ] as CFArray
         if let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0, 1]) {
             ctx.drawLinearGradient(
@@ -202,7 +226,9 @@ final class LineGraphView: NSView {
         ctx.setLineWidth(1.6)
         ctx.beginPath()
         ctx.move(to: positions[0])
-        for p in positions.dropFirst() { ctx.addLine(to: p) }
+        for p in positions.dropFirst() {
+            ctx.addLine(to: p)
+        }
         ctx.strokePath()
         ctx.restoreGState()
 
@@ -233,11 +259,10 @@ final class LineGraphView: NSView {
 
     private func positionTooltipNear(plotPoint: CGPoint) {
         let preferredX = min(max(plotPoint.x - 60, 8), bounds.width - tooltip.fittingSize.width - 8)
-        let preferredY: CGFloat
-        if plotPoint.y > bounds.height - 60 {
-            preferredY = plotPoint.y - tooltip.fittingSize.height - 12
+        let preferredY: CGFloat = if plotPoint.y > bounds.height - 60 {
+            plotPoint.y - tooltip.fittingSize.height - 12
         } else {
-            preferredY = max(plotPoint.y + 8, 8)
+            max(plotPoint.y + 8, 8)
         }
         // Anchor tooltip from top-left of view because subview frames flow that way.
         tooltipTopConstraint?.constant = bounds.height - preferredY - tooltip.fittingSize.height
@@ -294,12 +319,14 @@ private final class TooltipView: NSView {
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
-            widthAnchor.constraint(lessThanOrEqualToConstant: 240),
+            widthAnchor.constraint(lessThanOrEqualToConstant: 240)
         ])
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     func update(point: TimelinePoint, accent: NSColor) {
         labelTitle.stringValue = point.label

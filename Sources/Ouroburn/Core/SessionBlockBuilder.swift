@@ -63,8 +63,8 @@ private struct Bucket {
 
     init(start: Date, entry: UsageEntry) {
         self.start = start
-        self.entries = [entry]
-        self.lastTimestamp = entry.timestamp
+        entries = [entry]
+        lastTimestamp = entry.timestamp
     }
 
     mutating func add(_ entry: UsageEntry) {

@@ -1,8 +1,7 @@
 import AppKit
 
-/// Pill-shaped banner that floats above the popover content during a poll. Hidden when idle
-/// so it doesn't clutter the layout. Visible on the first cold launch (where the parser may
-/// take a couple minutes) so the user can tell the app is working rather than wedged.
+/// Minimal "still working" indicator. Tiny ghost-rim chip with just a spinner and an optional
+/// status word — no banner, no chrome. Sits in the footer corner so it never obscures content.
 @MainActor
 final class RefreshBanner: NSView {
     private let spinner = NSProgressIndicator()
@@ -11,14 +10,9 @@ final class RefreshBanner: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 12
-        layer?.backgroundColor = Theme.surfaceMuted.withAlphaComponent(0.92).cgColor
-        layer?.borderColor = Theme.divider.cgColor
-        layer?.borderWidth = 1
-        layer?.shadowColor = Theme.accentBlue.cgColor
-        layer?.shadowRadius = 8
-        layer?.shadowOpacity = 0.25
-        layer?.shadowOffset = .zero
+        layer?.cornerRadius = 9
+        layer?.backgroundColor = Theme.surface.withAlphaComponent(0.55).cgColor
+        Theme.applyGhostRim(layer!, color: Theme.accentBlue, rimAlpha: 0.22, glowRadius: 8, glowAlpha: 0.28)
         translatesAutoresizingMaskIntoConstraints = false
 
         spinner.style = .spinning
@@ -26,36 +20,49 @@ final class RefreshBanner: NSView {
         spinner.isDisplayedWhenStopped = false
         spinner.translatesAutoresizingMaskIntoConstraints = false
 
-        label.font = Theme.bodyFont(size: 11)
-        label.textColor = Theme.textPrimary
+        label.font = Theme.bodyFont(size: 10)
+        label.textColor = Theme.textSecondary
         label.translatesAutoresizingMaskIntoConstraints = false
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         addSubview(spinner)
         addSubview(label)
         NSLayoutConstraint.activate([
-            spinner.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            spinner.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             spinner.centerYAnchor.constraint(equalTo: centerYAnchor),
-            spinner.widthAnchor.constraint(equalToConstant: 14),
-            spinner.heightAnchor.constraint(equalToConstant: 14),
-            label.leadingAnchor.constraint(equalTo: spinner.trailingAnchor, constant: 8),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            label.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+            spinner.widthAnchor.constraint(equalToConstant: 12),
+            spinner.heightAnchor.constraint(equalToConstant: 12),
+            label.leadingAnchor.constraint(equalTo: spinner.trailingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4)
         ])
         isHidden = true
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     func setState(_ state: RefreshState) {
         if state.isRefreshing {
-            label.stringValue = state.message
+            label.stringValue = shortMessage(from: state.message)
             spinner.startAnimation(nil)
             isHidden = false
         } else {
             spinner.stopAnimation(nil)
             isHidden = true
         }
+    }
+
+    /// Trim verbose poll messages to a single word so the chip stays small.
+    private func shortMessage(from raw: String) -> String {
+        if raw.lowercased().contains("first") { return "warming up" }
+        if raw.lowercased().contains("parsing") { return "parsing" }
+        if raw.isEmpty { return "syncing" }
+        return raw.split(separator: " ").prefix(2).joined(separator: " ")
     }
 }

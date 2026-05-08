@@ -14,6 +14,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let multiplierField = NSTextField()
     private let minRateField = NSTextField()
     private let cooldownField = NSTextField()
+    private let oauthIntervalField = NSTextField()
     private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: " ")
@@ -30,11 +31,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         self.onPreferencesSaved = onPreferencesSaved
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 540, height: 580),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 680),
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
+        window.minSize = NSSize(width: 640, height: 600)
         window.title = "ouroburn settings"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
@@ -48,7 +50,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     func showOnTop() {
         Log.info(Log.ui, "Settings window showOnTop()")
@@ -127,7 +131,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
             statusLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 22),
             statusLabel.centerYAnchor.constraint(equalTo: saveButton.centerYAnchor),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: saveButton.leadingAnchor, constant: -12),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: saveButton.leadingAnchor, constant: -12)
         ])
 
         vc.view = root
@@ -135,11 +139,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     private func makeSecretsCard() -> NSView {
-        let card = card(title: "Tokens", subtitle: "Stored in the macOS keychain. Env vars override these. Paste persists on Save or field commit.")
+        let card = card(
+            title: "Tokens",
+            subtitle: "Stored in the macOS keychain. Env vars override these. Paste persists on Save or field commit."
+        )
 
         let oauthLabel = makeFieldLabel("CLAUDE_OAUTH_TOKEN")
         oauthField.translatesAutoresizingMaskIntoConstraints = false
-        oauthField.placeholderString = "claude.ai bearer token (Claude Enterprise)"
+        oauthField.placeholderString = "Claude OAuth bearer (used for /api/oauth/usage + claude.ai)"
         oauthField.delegate = self
         oauthField.target = self
         oauthField.action = #selector(secretFieldCommitted(_:))
@@ -189,7 +196,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             body.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
             body.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
             oauthRow.widthAnchor.constraint(equalTo: body.widthAnchor, constant: -28),
-            adminRow.widthAnchor.constraint(equalTo: body.widthAnchor, constant: -28),
+            adminRow.widthAnchor.constraint(equalTo: body.widthAnchor, constant: -28)
         ])
         return card
     }
@@ -271,6 +278,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         cooldownField.placeholderString = "600"
         cooldownField.alignment = .right
 
+        oauthIntervalField.translatesAutoresizingMaskIntoConstraints = false
+        oauthIntervalField.placeholderString = "5"
+        oauthIntervalField.alignment = .right
+
         modePopup.translatesAutoresizingMaskIntoConstraints = false
         for mode in ViewMode.allCases {
             modePopup.addItem(withTitle: mode.title)
@@ -281,7 +292,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             inlineRow("Spike multiplier", control: multiplierField, hint: "live > median × X"),
             inlineRow("Spike floor (TK/min)", control: minRateField, hint: "ignore below this"),
             inlineRow("Notification cooldown (s)", control: cooldownField, hint: "min 60"),
-            inlineRow("Default view", control: modePopup, hint: "loaded on launch"),
+            inlineRow(
+                "OAuth refresh (min)",
+                control: oauthIntervalField,
+                hint: "1–60 baseline · expo backoff up to 15"
+            ),
+            inlineRow("Default view", control: modePopup, hint: "loaded on launch")
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -292,7 +308,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 38),
             stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
             stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
         ])
         return card
     }
@@ -313,7 +329,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             label.topAnchor.constraint(equalTo: card.topAnchor, constant: 38),
             label.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
             label.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            label.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
+            label.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
         ])
         return card
     }
@@ -334,7 +350,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         view.addSubview(titleField)
         NSLayoutConstraint.activate([
             titleField.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
-            titleField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            titleField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14)
         ])
 
         if let subtitle {
@@ -346,7 +362,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             NSLayoutConstraint.activate([
                 subtitleField.topAnchor.constraint(equalTo: titleField.bottomAnchor, constant: 2),
                 subtitleField.leadingAnchor.constraint(equalTo: titleField.leadingAnchor),
-                subtitleField.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -14),
+                subtitleField.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -14)
             ])
         }
         return view
@@ -388,7 +404,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             hintField.centerYAnchor.constraint(equalTo: row.centerYAnchor),
             hintField.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
 
-            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 30),
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 30)
         ])
         return row
     }
@@ -417,6 +433,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         multiplierField.stringValue = String(format: "%.2f", prefs.spikeMultiplier)
         minRateField.stringValue = String(Int(prefs.spikeMinimumRate))
         cooldownField.stringValue = String(Int(prefs.notificationCooldownSeconds))
+        oauthIntervalField.stringValue = String(Int(prefs.oauthRefreshMinutes))
         if let index = ViewMode.allCases.firstIndex(of: prefs.defaultMode) {
             modePopup.selectItem(at: index)
         }
@@ -425,20 +442,23 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         oauthField.stringValue = oauth
         adminField.stringValue = admin
         oauthIndicator.setActive(!oauth.isEmpty || ProcessInfo.processInfo.environment["CLAUDE_OAUTH_TOKEN"] != nil)
-        adminIndicator.setActive(!admin.isEmpty || ProcessInfo.processInfo.environment["ANTHROPIC_ADMIN_API_KEY"] != nil)
+        adminIndicator
+            .setActive(!admin.isEmpty || ProcessInfo.processInfo.environment["ANTHROPIC_ADMIN_API_KEY"] != nil)
     }
 
     @objc private func savePressed() {
         let multiplier = Double(multiplierField.stringValue) ?? Preferences.default.spikeMultiplier
         let minRate = Double(minRateField.stringValue) ?? Preferences.default.spikeMinimumRate
         let cooldown = Double(cooldownField.stringValue) ?? Preferences.default.notificationCooldownSeconds
+        let oauthInterval = Double(oauthIntervalField.stringValue) ?? Preferences.default.oauthRefreshMinutes
         let mode = ViewMode.allCases[modePopup.indexOfSelectedItem]
 
         let prefs = Preferences(
             spikeMultiplier: max(1.05, multiplier),
             spikeMinimumRate: max(0, minRate),
             defaultMode: mode,
-            notificationCooldownSeconds: max(60, cooldown)
+            notificationCooldownSeconds: max(60, cooldown),
+            oauthRefreshMinutes: min(max(1, oauthInterval), 60)
         )
         PreferencesStore.save(prefs)
 
@@ -491,13 +511,15 @@ private final class StatusDot: NSView {
         addSubview(inner)
         NSLayoutConstraint.activate([
             inner.widthAnchor.constraint(equalTo: widthAnchor),
-            inner.heightAnchor.constraint(equalTo: heightAnchor),
+            inner.heightAnchor.constraint(equalTo: heightAnchor)
         ])
         setActive(false)
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     func setActive(_ active: Bool) {
         inner.layer?.backgroundColor = (active ? Theme.accentLime : Theme.textTertiary).cgColor

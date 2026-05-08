@@ -1,6 +1,6 @@
 import Foundation
-import Testing
 @testable import Ouroburn
+import Testing
 
 @Suite("Aggregator")
 struct AggregatorTests {
@@ -16,7 +16,7 @@ struct AggregatorTests {
             outputCostPerToken: 0.000075,
             cacheCreationCostPerToken: 0.00001875,
             cacheReadCostPerToken: 0.0000015
-        ),
+        )
     ]
 
     private func makeEntry(
@@ -58,7 +58,7 @@ struct AggregatorTests {
         let entries = [
             makeEntry(ts: "2026-05-06T10:00:00.000Z", model: "claude-sonnet-4-20250514", input: 100, output: 200),
             makeEntry(ts: "2026-05-06T22:00:00.000Z", model: "claude-sonnet-4-20250514", input: 50, output: 50),
-            makeEntry(ts: "2026-05-07T08:00:00.000Z", model: "claude-sonnet-4-20250514", input: 25, output: 25),
+            makeEntry(ts: "2026-05-07T08:00:00.000Z", model: "claude-sonnet-4-20250514", input: 25, output: 25)
         ]
         let buckets = aggregator.aggregate(entries: entries, mode: .day)
         #expect(buckets.count == 2)
@@ -72,7 +72,7 @@ struct AggregatorTests {
         let entries = [
             makeEntry(ts: "2026-05-06T10:00:00.000Z", model: "claude-sonnet-4-20250514", input: 1, output: 1),
             makeEntry(ts: "2026-05-31T10:00:00.000Z", model: "claude-sonnet-4-20250514", input: 1, output: 1),
-            makeEntry(ts: "2026-06-01T10:00:00.000Z", model: "claude-sonnet-4-20250514", input: 1, output: 1),
+            makeEntry(ts: "2026-06-01T10:00:00.000Z", model: "claude-sonnet-4-20250514", input: 1, output: 1)
         ]
         let buckets = aggregator.aggregate(entries: entries, mode: .month)
         #expect(buckets.map(\.id) == ["2026-06", "2026-05"])
@@ -84,7 +84,7 @@ struct AggregatorTests {
         let entry = makeEntry(
             ts: "2026-05-06T10:00:00.000Z",
             model: "claude-sonnet-4-20250514",
-            input: 1_000, output: 1_000,
+            input: 1000, output: 1000,
             cost: 99.99
         )
         #expect(abs(aggregator.cost(of: entry) - 99.99) < 0.0001)
@@ -106,7 +106,7 @@ struct AggregatorTests {
         let entries = [
             makeEntry(ts: "2026-05-06T10:00:00.000Z", model: "claude-sonnet-4-20250514", input: 100, output: 100),
             makeEntry(ts: "2026-05-06T10:00:00.000Z", model: "claude-opus-4-20250620", input: 200, output: 200),
-            makeEntry(ts: "2026-05-06T11:00:00.000Z", model: "claude-sonnet-4-20250514", input: 50, output: 50),
+            makeEntry(ts: "2026-05-06T11:00:00.000Z", model: "claude-sonnet-4-20250514", input: 50, output: 50)
         ]
         let buckets = aggregator.aggregate(entries: entries, mode: .day)
         #expect(buckets.count == 1)
@@ -122,12 +122,30 @@ struct AggregatorTests {
     @Test func sessionGroupingByProjectAndSessionId() {
         let aggregator = Aggregator(pricing: pricing)
         let entries = [
-            makeEntry(ts: "2026-05-06T10:00:00.000Z", model: "claude-sonnet-4-20250514",
-                      input: 100, output: 100, project: "alpha", session: "S1"),
-            makeEntry(ts: "2026-05-06T10:05:00.000Z", model: "claude-sonnet-4-20250514",
-                      input: 100, output: 100, project: "alpha", session: "S1"),
-            makeEntry(ts: "2026-05-06T11:00:00.000Z", model: "claude-sonnet-4-20250514",
-                      input: 100, output: 100, project: "beta", session: "S2"),
+            makeEntry(
+                ts: "2026-05-06T10:00:00.000Z",
+                model: "claude-sonnet-4-20250514",
+                input: 100,
+                output: 100,
+                project: "alpha",
+                session: "S1"
+            ),
+            makeEntry(
+                ts: "2026-05-06T10:05:00.000Z",
+                model: "claude-sonnet-4-20250514",
+                input: 100,
+                output: 100,
+                project: "alpha",
+                session: "S1"
+            ),
+            makeEntry(
+                ts: "2026-05-06T11:00:00.000Z",
+                model: "claude-sonnet-4-20250514",
+                input: 100,
+                output: 100,
+                project: "beta",
+                session: "S2"
+            )
         ]
         let buckets = aggregator.aggregate(entries: entries, mode: .session)
         #expect(buckets.count == 2)
@@ -139,7 +157,7 @@ struct AggregatorTests {
         let aggregator = Aggregator(pricing: pricing, calendar: utcCalendar(), weekStart: 1)
         let entries = [
             makeEntry(ts: "2026-05-04T10:00:00.000Z", model: "claude-sonnet-4-20250514", input: 1, output: 1),
-            makeEntry(ts: "2026-05-08T10:00:00.000Z", model: "claude-sonnet-4-20250514", input: 1, output: 1),
+            makeEntry(ts: "2026-05-08T10:00:00.000Z", model: "claude-sonnet-4-20250514", input: 1, output: 1)
         ]
         let buckets = aggregator.aggregate(entries: entries, mode: .week)
         #expect(buckets.count == 1)

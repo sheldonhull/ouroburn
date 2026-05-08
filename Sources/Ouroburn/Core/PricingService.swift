@@ -12,7 +12,8 @@ struct ModelPricing: Sendable, Equatable {
 }
 
 actor PricingService {
-    static let feedURL = URL(string: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json")!
+    static let feedURL =
+        URL(string: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json")!
     static let prefixCandidates = ["", "anthropic/", "claude-3-5-", "claude-3-", "claude-", "openrouter/openai/"]
     static let cacheTTL: TimeInterval = 24 * 60 * 60
 
@@ -36,15 +37,22 @@ actor PricingService {
 
     /// Synchronous variant for callers already holding the resolved table — used by the
     /// aggregator's hot path to avoid awaiting per entry.
-    func currentTable() -> [String: ModelPricing] { table }
+    func currentTable() -> [String: ModelPricing] {
+        table
+    }
 
-    func ensureLoaded() async { if loadedAt == nil { await load() } }
+    func ensureLoaded() async {
+        if loadedAt == nil { await load() }
+    }
 
     private func load() async {
         if let disk = readDiskCache(), Date().timeIntervalSince(disk.loadedAt) < Self.cacheTTL {
             table = disk.table
             loadedAt = disk.loadedAt
-            Log.info(Log.pricing, "Loaded \(disk.table.count) entries from disk cache (age \(Int(Date().timeIntervalSince(disk.loadedAt)))s)")
+            Log.info(
+                Log.pricing,
+                "Loaded \(disk.table.count) entries from disk cache (age \(Int(Date().timeIntervalSince(disk.loadedAt)))s)"
+            )
             return
         }
         do {

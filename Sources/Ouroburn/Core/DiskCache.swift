@@ -2,12 +2,31 @@ import Foundation
 
 /// JSON-on-disk cache so the popover has data to show before the first poll completes —
 /// essential when running offline or right after launch.
+///
+/// Schema-tolerant: optional fields are nil on cache files written by older builds; the boot
+/// path falls back to legacy `buckets`/`mode` when the per-mode dictionary is absent.
 struct CachedSnapshot: Codable, Sendable {
     let savedAt: Date
     let buckets: [CachedBucket]
     let mode: String
     let burnRatePerMinute: Double
     let recentSpike: Bool
+
+    // Added in schema v2 — all optional so older cache files still decode and call sites that
+    // don't yet supply the richer fields keep compiling. Declared `var` so the synthesized
+    // memberwise initializer treats them as defaulted parameters (a `let` with an inline default
+    // is excluded from the memberwise init entirely).
+    var bucketsByMode: [String: [CachedBucket]]? = nil
+    var timelinesByMode: [String: [CachedTimelinePoint]]? = nil
+    var medianTokensPerMinute: Double? = nil
+    var costPerHour: Double? = nil
+    var todayTokens: Int? = nil
+    var todayCostUSD: Double? = nil
+    var weekTokens: Int? = nil
+    var weekCostUSD: Double? = nil
+    var monthTokens: Int? = nil
+    var monthCostUSD: Double? = nil
+    var billedMonthUSD: Double? = nil
 
     struct CachedBucket: Codable, Sendable {
         let id: String
@@ -31,6 +50,39 @@ struct CachedSnapshot: Codable, Sendable {
         let cacheCreationTokens: Int
         let cacheReadTokens: Int
         let costUSD: Double
+    }
+
+    struct CachedTimelinePoint: Codable, Sendable {
+        let timestamp: Date
+        let label: String
+        let tokens: Int
+        let costUSD: Double
+        let topSession: String?
+        let topSessionTokens: Int
+    }
+}
+
+extension CachedSnapshot.CachedTimelinePoint {
+    init(_ point: TimelinePoint) {
+        self.init(
+            timestamp: point.timestamp,
+            label: point.label,
+            tokens: point.tokens,
+            costUSD: point.costUSD,
+            topSession: point.topSession,
+            topSessionTokens: point.topSessionTokens
+        )
+    }
+
+    func toTimelinePoint() -> TimelinePoint {
+        TimelinePoint(
+            timestamp: timestamp,
+            label: label,
+            tokens: tokens,
+            costUSD: costUSD,
+            topSession: topSession,
+            topSessionTokens: topSessionTokens
+        )
     }
 }
 
@@ -96,8 +148,6 @@ extension CachedSnapshot.CachedBucket {
 
 struct DiskCache {
     let url: URL
-
-    init(url: URL) { self.url = url }
 
     func load() -> CachedSnapshot? {
         guard let data = try? Data(contentsOf: url) else { return nil }

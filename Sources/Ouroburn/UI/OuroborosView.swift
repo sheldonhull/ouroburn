@@ -25,7 +25,7 @@ final class OuroborosView: NSView {
     static let hotColor = Theme.accentRed
     static let baseRPS: CGFloat = 0.10
     static let maxRPS: CGFloat = 1.50
-    static let spikeMultiplier: CGFloat = 1.30  // live > median * spikeMultiplier kicks the ramp
+    static let spikeMultiplier: CGFloat = 1.30 // live > median * spikeMultiplier kicks the ramp
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -38,7 +38,9 @@ final class OuroborosView: NSView {
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     /// Drive the rotation + color from the live vs. median rate.
     ///
@@ -60,7 +62,10 @@ final class OuroborosView: NSView {
         }
         glowColor = bodyColor.withAlphaComponent(0.55)
         layer?.shadowColor = bodyColor.cgColor
-        layer?.shadowRadius = 3 + 5 * CGFloat(min(1, max(0, (ratio - Double(Self.spikeMultiplier)) / Double(Self.spikeMultiplier))))
+        layer?.shadowRadius = 3 + 5 * CGFloat(min(
+            1,
+            max(0, (ratio - Double(Self.spikeMultiplier)) / Double(Self.spikeMultiplier))
+        ))
         needsDisplay = true
     }
 
@@ -131,8 +136,13 @@ final class OuroborosView: NSView {
         ctx.saveGState()
         ctx.setShadow(offset: .zero, blur: 6, color: glowColor.cgColor)
         let haloPath = CGMutablePath()
-        haloPath.addArc(center: center, radius: (outerHead + outerTail) / 2, startAngle: bodyStart,
-                        endAngle: bodyEnd, clockwise: false)
+        haloPath.addArc(
+            center: center,
+            radius: (outerHead + outerTail) / 2,
+            startAngle: bodyStart,
+            endAngle: bodyEnd,
+            clockwise: false
+        )
         ctx.addPath(haloPath)
         ctx.setStrokeColor(mainColor.withAlphaComponent(0.0).cgColor)
         ctx.setLineWidth(1)
@@ -142,14 +152,14 @@ final class OuroborosView: NSView {
         // Body path
         let bodyPath = CGMutablePath()
         let steps = 56
-        for i in 0...steps {
+        for i in 0 ... steps {
             let t = CGFloat(i) / CGFloat(steps)
             let angle = bodyStart + t * (bodyEnd - bodyStart)
             let radial = lerp(outerTail, outerHead, t)
             let p = CGPoint(x: center.x + radial * cos(angle), y: center.y + radial * sin(angle))
             i == 0 ? bodyPath.move(to: p) : bodyPath.addLine(to: p)
         }
-        for i in 0...steps {
+        for i in 0 ... steps {
             let t = CGFloat(i) / CGFloat(steps)
             let angle = bodyEnd - t * (bodyEnd - bodyStart)
             let radial = lerp(innerHead, innerTail, t)
@@ -168,7 +178,7 @@ final class OuroborosView: NSView {
         ctx.addPath(bodyPath)
         ctx.clip()
         let highlightPath = CGMutablePath()
-        for i in 0...steps {
+        for i in 0 ... steps {
             let t = CGFloat(i) / CGFloat(steps)
             let angle = bodyStart + t * (bodyEnd - bodyStart)
             let radial = lerp(outerTail, outerHead, t) - 1.2
@@ -185,7 +195,7 @@ final class OuroborosView: NSView {
         ctx.setLineWidth(0.4)
         ctx.setStrokeColor(darkColor.withAlphaComponent(0.55).cgColor)
         let scaleCount = 16
-        for i in 0..<scaleCount {
+        for i in 0 ..< scaleCount {
             let t = CGFloat(i) / CGFloat(scaleCount - 1)
             let angle = bodyStart + t * (bodyEnd - bodyStart)
             let inner = lerp(innerHead, innerTail, 1 - t)
@@ -259,7 +269,12 @@ final class OuroborosView: NSView {
         let eyeSize: CGFloat = max(0.6, headSize * 0.32)
         ctx.setFillColor(NSColor.white.cgColor)
         ctx.beginPath()
-        ctx.addEllipse(in: CGRect(x: eyeCenter.x - eyeSize, y: eyeCenter.y - eyeSize, width: eyeSize * 2, height: eyeSize * 2))
+        ctx.addEllipse(in: CGRect(
+            x: eyeCenter.x - eyeSize,
+            y: eyeCenter.y - eyeSize,
+            width: eyeSize * 2,
+            height: eyeSize * 2
+        ))
         ctx.fillPath()
         let pupilSize = eyeSize * 0.55
         ctx.setFillColor(NSColor.black.cgColor)
@@ -279,8 +294,14 @@ final class OuroborosView: NSView {
         let tailWidth: CGFloat = (outerTail - innerTail) * 0.22
         let tailPath = CGMutablePath()
         tailPath.move(to: tailTip)
-        tailPath.addLine(to: CGPoint(x: tailCenter.x + tailFlare.x * tailWidth, y: tailCenter.y + tailFlare.y * tailWidth))
-        tailPath.addLine(to: CGPoint(x: tailCenter.x - tailFlare.x * tailWidth, y: tailCenter.y - tailFlare.y * tailWidth))
+        tailPath.addLine(to: CGPoint(
+            x: tailCenter.x + tailFlare.x * tailWidth,
+            y: tailCenter.y + tailFlare.y * tailWidth
+        ))
+        tailPath.addLine(to: CGPoint(
+            x: tailCenter.x - tailFlare.x * tailWidth,
+            y: tailCenter.y - tailFlare.y * tailWidth
+        ))
         tailPath.closeSubpath()
         ctx.addPath(tailPath)
         ctx.setFillColor(darkColor.cgColor)

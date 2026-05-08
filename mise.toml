@@ -20,6 +20,14 @@ run = """
 open .build/Ouroburn.app
 """
 
+[tasks.relaunch]
+description = "Kill any running Ouroburn, rebuild the debug bundle, relaunch"
+run = """
+pkill -f 'Ouroburn.app/Contents/MacOS/ouroburn' 2>/dev/null || true
+./scripts/bundle-app.sh debug
+open .build/Ouroburn.app
+"""
+
 [tasks.run-loose]
 description = "Run the loose Mach-O binary (no notifications, fast iteration)"
 run = "swift run ouroburn"

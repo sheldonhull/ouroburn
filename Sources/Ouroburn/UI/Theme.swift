@@ -27,7 +27,8 @@ enum Theme {
 
     static func titleFont(size: CGFloat = 13) -> NSFont {
         if let descriptor = NSFont.systemFont(ofSize: size, weight: .semibold)
-            .fontDescriptor.withDesign(.rounded) {
+            .fontDescriptor.withDesign(.rounded)
+        {
             return NSFont(descriptor: descriptor, size: size) ?? NSFont.systemFont(ofSize: size, weight: .semibold)
         }
         return NSFont.systemFont(ofSize: size, weight: .semibold)
@@ -43,8 +44,8 @@ enum Theme {
             .fontDescriptor.addingAttributes([
                 .featureSettings: [[
                     NSFontDescriptor.FeatureKey.typeIdentifier: kNumberSpacingType,
-                    NSFontDescriptor.FeatureKey.selectorIdentifier: kMonospacedNumbersSelector,
-                ]],
+                    NSFontDescriptor.FeatureKey.selectorIdentifier: kMonospacedNumbersSelector
+                ]]
             ])
         return NSFont(descriptor: descriptor, size: size) ?? NSFont.systemFont(ofSize: size, weight: .medium)
     }
@@ -58,11 +59,34 @@ enum Theme {
         return shadow
     }
 
-    static func glowAttributedTitle(_ text: String, color: NSColor = accentBlue, font: NSFont? = nil) -> NSAttributedString {
+    /// "Ghost rim" treatment lifted from the sift renderer (`.sift-glow-*`). 1px tinted outline
+    /// + soft outer halo, no body wash. Apply to a layer-backed view's `layer` once it has
+    /// `wantsLayer = true`.
+    static func applyGhostRim(
+        _ layer: CALayer,
+        color: NSColor = accentBlue,
+        rimAlpha: CGFloat = 0.28,
+        glowRadius: CGFloat = 12,
+        glowAlpha: CGFloat = 0.32
+    ) {
+        layer.borderWidth = 1
+        layer.borderColor = color.withAlphaComponent(rimAlpha).cgColor
+        layer.shadowColor = color.cgColor
+        layer.shadowRadius = glowRadius
+        layer.shadowOpacity = Float(glowAlpha)
+        layer.shadowOffset = .zero
+        layer.masksToBounds = false
+    }
+
+    static func glowAttributedTitle(
+        _ text: String,
+        color: NSColor = accentBlue,
+        font: NSFont? = nil
+    ) -> NSAttributedString {
         NSAttributedString(string: text, attributes: [
             .font: font ?? titleFont(size: 13),
             .foregroundColor: color,
-            .shadow: glow(color: color, radius: 5),
+            .shadow: glow(color: color, radius: 5)
         ])
     }
 }

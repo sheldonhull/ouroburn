@@ -1,6 +1,6 @@
 import Foundation
-import Testing
 @testable import Ouroburn
+import Testing
 
 @Suite("Pricing")
 struct PricingServiceTests {
@@ -48,7 +48,7 @@ struct PricingServiceTests {
                 outputCostPerToken: 0.000005,
                 cacheCreationCostPerToken: 0,
                 cacheReadCostPerToken: 0
-            ),
+            )
         ]
         #expect(PricingResolver.resolve(model: "claude-haiku-4-5", table: table) != nil)
         #expect(PricingResolver.resolve(model: "anthropic/claude-haiku-4-5", table: table) != nil)
@@ -61,7 +61,7 @@ struct PricingServiceTests {
                 outputCostPerToken: 0.000015,
                 cacheCreationCostPerToken: 0,
                 cacheReadCostPerToken: 0
-            ),
+            )
         ]
         #expect(PricingResolver.resolve(model: "CLAUDE-SONNET-4-20250514", table: table) != nil)
     }

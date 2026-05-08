@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var tracker: BurnTracker?
     private var notifier: Notifier?
     private var settingsWindow: SettingsWindowController?
+    private var spendHistoryWindow: BillingHistoryWindowController?
 
     func applicationDidFinishLaunching(_: Notification) {
         Log.info(Log.app, "ouroburn launching (bundle=\(Bundle.main.bundleIdentifier ?? "<none>"))")
@@ -49,10 +50,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusBar.onShowSettings = { [self] in
             Log.info(Log.app, "onShowSettings closure fired")
-            self.showSettings()
+            showSettings()
         }
         statusBar.onRevealLogs = {
             NSWorkspace.shared.open(Log.fileSink.location.deletingLastPathComponent())
+        }
+        statusBar.onLoginRequested = { [weak self] in
+            self?.handleConnectionToggle()
+        }
+        statusBar.onShowSpendHistory = { [weak self] in
+            self?.showSpendHistory()
         }
         Log.info(Log.app, "Closures wired (onShowSettings=\(statusBar.onShowSettings != nil))")
 
@@ -73,6 +80,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_: Notification) {
         Log.info(Log.app, "ouroburn terminating")
         tracker?.stop()
+    }
+
+    private func showSpendHistory() {
+        if spendHistoryWindow == nil {
+            spendHistoryWindow = BillingHistoryWindowController()
+        }
+        spendHistoryWindow?.showOnTop()
+    }
+
+    private func handleConnectionToggle() {
+        if OAuthCredentialStore.load() != nil {
+            OAuthCredentialStore.clear()
+            Log.info(Log.app, "OAuth credential cleared")
+            statusBar?.setConnectionState(.disconnected)
+            tracker?.forceRefresh()
+            return
+        }
+        statusBar?.setConnectionState(.authorizing)
+        Task {
+            do {
+                let (authURL, completion) = try await OAuthLogin.startLogin()
+                NSWorkspace.shared.open(authURL)
+                let credential = try await completion()
+                OAuthCredentialStore.save(credential)
+                Log.info(Log.app, "OAuth login succeeded — credential stored")
+                statusBar?.setConnectionState(.connected(spendUSD: nil))
+                tracker?.forceRefresh()
+            } catch {
+                Log.error(Log.app, "OAuth login failed: \(error)")
+                statusBar?.setConnectionState(.disconnected)
+            }
+        }
     }
 
     private func showSettings() {

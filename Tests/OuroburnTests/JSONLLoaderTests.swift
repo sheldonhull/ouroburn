@@ -1,6 +1,6 @@
 import Foundation
-import Testing
 @testable import Ouroburn
+import Testing
 
 @Suite("JSONLLoader")
 struct JSONLLoaderTests {
@@ -61,7 +61,7 @@ struct JSONLLoaderTests {
         {"timestamp":"2026-05-06T10:30:00.000Z","requestId":"r2","message":{"id":"m2","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}
         """
         try content.write(to: url, atomically: true, encoding: .utf8)
-        let cutoff = ISO8601.parse("2026-05-06T10:00:00.000Z")!
+        let cutoff = try #require(ISO8601.parse("2026-05-06T10:00:00.000Z"))
         var seen = Set<String>()
         let entries = JSONLLoader().load(from: url, seenKeys: &seen, sinceTimestamp: cutoff)
         #expect(entries.count == 1)

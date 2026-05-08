@@ -35,13 +35,15 @@ final class PaneSpinner: NSView {
             label.leadingAnchor.constraint(equalTo: spinner.trailingAnchor, constant: 8),
             label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             label.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8)
         ])
         isHidden = true
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     func setLoading(_ loading: Bool) {
         if loading {

@@ -50,7 +50,10 @@ struct Aggregator {
             let dayCount = daysInCurrentMonth(now)
             return dailyTimeline(entries: entries, anchor: startOfMonth(now), days: dayCount)
         case .session:
-            return []
+            // Session rows have no inherent time axis, so the graph summarises cost over the
+            // trailing 7 days of activity feeding the session list.
+            let anchor = calendar.date(byAdding: .day, value: -6, to: startOfDay(now)) ?? now
+            return dailyTimeline(entries: entries, anchor: anchor, days: 7)
         }
     }
 
@@ -60,7 +63,7 @@ struct Aggregator {
         points.reserveCapacity(hours)
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
-        for hourIndex in 0..<hours {
+        for hourIndex in 0 ..< hours {
             let bucketStart = anchor.addingTimeInterval(Double(hourIndex) * bucketSize)
             let bucketEnd = bucketStart.addingTimeInterval(bucketSize)
             let slice = entries.filter { $0.timestamp >= bucketStart && $0.timestamp < bucketEnd }
@@ -74,7 +77,7 @@ struct Aggregator {
         formatter.dateFormat = "MMM d"
         var points: [TimelinePoint] = []
         points.reserveCapacity(days)
-        for dayIndex in 0..<days {
+        for dayIndex in 0 ..< days {
             let bucketStart = calendar.date(byAdding: .day, value: dayIndex, to: anchor) ?? anchor
             let bucketEnd = calendar.date(byAdding: .day, value: 1, to: bucketStart) ?? bucketStart
             let slice = entries.filter { $0.timestamp >= bucketStart && $0.timestamp < bucketEnd }
