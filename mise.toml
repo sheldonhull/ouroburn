@@ -17,7 +17,7 @@ run = "swift build -c release"
 description = "Run as a proper .app bundle (UNUserNotificationCenter needs CFBundleIdentifier)"
 run = """
 ./scripts/bundle-app.sh debug
-open .build/Ouroburn.app
+launchctl asuser "$(id -u)" open .build/Ouroburn.app
 """
 
 [tasks.relaunch]
@@ -25,7 +25,7 @@ description = "Kill any running Ouroburn, rebuild the debug bundle, relaunch"
 run = """
 pkill -f 'Ouroburn.app/Contents/MacOS/ouroburn' 2>/dev/null || true
 ./scripts/bundle-app.sh debug
-open .build/Ouroburn.app
+launchctl asuser "$(id -u)" open .build/Ouroburn.app
 """
 
 [tasks.run-loose]
@@ -63,3 +63,120 @@ depends = ["lint", "build"]
 [tasks.clean]
 description = "Clean build artifacts"
 run = "swift package clean && rm -rf .build"
+
+# --- macOS code-signing (stop TCC re-prompts on rebuild) -----------------------
+# Self-signed cert in login keychain. Designated requirement pins to cert leaf
+# instead of cdhash, so TCC grants (Accessibility / ScreenCapture / AppleEvents)
+# survive every rebuild. See: https://docs.anthropic.com (skill: macos-stable-codesign)
+
+[tasks."cert:create"]
+description = "One-time: create 'Ouroburn Dev Signing' cert in login keychain"
+run_windows = "echo cert:create is macOS-only - skipping"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$(uname -s)" == "Darwin" ]] || { echo cert:create macOS-only - skipping; exit 0; }
+
+CERT_NAME="Ouroburn Dev Signing"
+LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+
+if security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
+    echo "OK cert '$CERT_NAME' already in login keychain"
+    exit 0
+fi
+
+echo "-> creating self-signed code-signing cert: $CERT_NAME"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+cat >"$TMP/cert.conf" <<CONF
+[req]
+prompt             = no
+distinguished_name = dn
+x509_extensions    = v3_req
+[dn]
+CN = $CERT_NAME
+[v3_req]
+keyUsage             = critical, digitalSignature
+extendedKeyUsage     = critical, codeSigning
+basicConstraints     = critical, CA:FALSE
+subjectKeyIdentifier = hash
+CONF
+
+openssl genrsa -out "$TMP/key.pem" 2048 2>/dev/null
+openssl req -x509 -key "$TMP/key.pem" -sha256 -days 3650 \
+    -out "$TMP/cert.pem" -config "$TMP/cert.conf" 2>/dev/null
+
+# -T pre-grants codesign + security ACL on the private key; without these
+# every codesign invocation pops a keychain prompt.
+security import "$TMP/key.pem" -k "$LOGIN_KEYCHAIN" \
+    -T /usr/bin/codesign -T /usr/bin/security
+security import "$TMP/cert.pem" -k "$LOGIN_KEYCHAIN"
+
+echo "OK cert added. First codesign run pops ONE keychain dialog -> click 'Always Allow'."
+"""
+
+[tasks."app:sign"]
+description = "Re-sign existing .build/Ouroburn.app with stable dev cert; verify DR is leaf-pinned"
+depends = ["cert:create"]
+run_windows = "echo app:sign is macOS-only - skipping"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$(uname -s)" == "Darwin" ]] || { echo app:sign macOS-only - skipping; exit 0; }
+
+CERT_NAME="Ouroburn Dev Signing"
+APP="${APP:-.build/Ouroburn.app}"
+
+[[ -d "$APP" ]] || { echo "Bundle not found at $APP - run 'mise run run' first" >&2; exit 1; }
+
+codesign --force --deep --sign "$CERT_NAME" --timestamp=none "$APP"
+
+DR=$(codesign -d -r- "$APP" 2>&1 | grep designated || echo "no DR")
+echo "OK signed: $APP"
+echo "  $DR"
+
+if echo "$DR" | grep -q 'cdhash H"'; then
+    echo "FAIL DR still cdhash-pinned. Cert not applied. TCC grants will reset on rebuild." >&2
+    exit 1
+fi
+"""
+
+[tasks."app:diag"]
+description = "Diagnose codesign state: identity, DR, bundle id"
+run_windows = "echo app:diag is macOS-only - skipping"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$(uname -s)" == "Darwin" ]] || { echo app:diag macOS-only - skipping; exit 0; }
+
+APP="${APP:-.build/Ouroburn.app}"
+[[ -d "$APP" ]] || { echo "App not found at $APP" >&2; exit 1; }
+
+echo "=== $APP ==="
+codesign -d --verbose=4 "$APP" 2>&1 | grep -E '^(Identifier|TeamIdentifier|Authority|CDHash|Format)='
+echo
+echo "=== Designated Requirement ==="
+codesign -d -r- "$APP" 2>&1 | grep designated
+echo
+echo "=== Bundle ID ==="
+/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist"
+"""
+
+[tasks."app:reset-permissions"]
+description = "Wipe TCC grants for ouroburn (debug only - re-prompts next launch)"
+run_windows = "echo reset-permissions is macOS-only - no TCC on Windows"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$(uname -s)" == "Darwin" ]] || { echo reset-permissions macOS-only; exit 0; }
+
+BUNDLE_ID="${BUNDLE_ID:-dev.sheldonhull.ouroburn}"
+echo "-> resetting TCC grants for $BUNDLE_ID"
+tccutil reset Accessibility        "$BUNDLE_ID" 2>/dev/null || true
+tccutil reset ScreenCapture        "$BUNDLE_ID" 2>/dev/null || true
+tccutil reset AppleEvents          "$BUNDLE_ID" 2>/dev/null || true
+tccutil reset SystemPolicyAllFiles "$BUNDLE_ID" 2>/dev/null || true
+pkill -f "$BUNDLE_ID" 2>/dev/null || true
+echo "OK done. Next launch will re-prompt."
+"""

@@ -47,7 +47,21 @@ cat >"$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Adhoc-sign so macOS allows the app to launch and request notification authorization.
-codesign --force --deep --sign - "$APP_DIR" >/dev/null
+# Sign with stable dev cert when present so the designated requirement is pinned to
+# the cert leaf instead of the cdhash; that lets TCC grants survive cdhash drift across
+# rebuilds. Run `mise run cert:create` once to populate the keychain. Falls back to
+# adhoc sign so first-time users (and CI) still get a launchable bundle.
+CERT_NAME="${CERT_NAME:-Ouroburn Dev Signing}"
+if security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
+    codesign --force --deep --sign "$CERT_NAME" --timestamp=none "$APP_DIR" >/dev/null
+    SIGN_MODE="cert: $CERT_NAME"
+else
+    codesign --force --deep --sign - "$APP_DIR" >/dev/null
+    SIGN_MODE="adhoc (run 'mise run cert:create' to stop TCC re-prompts)"
+fi
+
+# Strip quarantine so Gatekeeper doesn't first-launch-prompt on a freshly built bundle.
+xattr -cr "$APP_DIR" 2>/dev/null || true
 
 echo "Built $APP_DIR"
+echo "  signed: $SIGN_MODE"
