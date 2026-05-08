@@ -145,9 +145,9 @@ final class BillingHistoryWindowController: NSWindowController {
             let entries = groups[day] ?? []
             let first = entries.first?.sample.totalUSD ?? 0
             let last = entries.last?.sample.totalUSD ?? 0
-            let dayDelta = entries.first.flatMap { $0.prior }
-                .map { entries.last!.sample.totalUSD - $0.totalUSD }
-                ?? max(0, last - first)
+            // Within-day MTD growth only. Avoids attributing pre-midnight spend (the gap between
+            // yesterday's last sample and today's first sample) to today.
+            let dayDelta = max(0, last - first)
             // Show samples newest-first inside the day.
             let ordered = entries.sorted { $0.sample.timestamp > $1.sample.timestamp }
             rows.append(DayRow(day: day, samples: ordered, latest: last, dayDelta: dayDelta))

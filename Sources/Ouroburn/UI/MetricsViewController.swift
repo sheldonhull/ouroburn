@@ -18,6 +18,8 @@ final class MetricsViewController: NSViewController {
     private let monthTile = StatTile(title: "This month", symbol: "creditcard")
 
     private let segmented = NSSegmentedControl()
+    private let heartbeatView = OAuthHeartbeatView()
+    private let heartbeatStore = BillingSampleStore()
     private let graphView = LineGraphView()
     private let graphSpinner = PaneSpinner(message: "Building timeline…")
     private let listSpinner = PaneSpinner(message: "Parsing transcripts…")
@@ -145,9 +147,14 @@ final class MetricsViewController: NSViewController {
         }
 
         renderHero(snapshot: snapshot)
+        renderHeartbeat()
         renderGraph(snapshot: snapshot)
         renderListIfChanged(snapshot: snapshot)
         renderFooter(snapshot: snapshot)
+    }
+
+    private func renderHeartbeat() {
+        heartbeatView.update(samples: heartbeatStore.load())
     }
 
     @objc private func segmentChanged(_ sender: NSSegmentedControl) {
@@ -341,15 +348,22 @@ final class MetricsViewController: NSViewController {
     }
 
     private func configureGraph() {
+        heartbeatView.translatesAutoresizingMaskIntoConstraints = false
         graphView.translatesAutoresizingMaskIntoConstraints = false
         graphSpinner.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(heartbeatView)
         view.addSubview(graphView)
         view.addSubview(graphSpinner)
         NSLayoutConstraint.activate([
-            graphView.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 12),
+            heartbeatView.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 10),
+            heartbeatView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            heartbeatView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+            heartbeatView.heightAnchor.constraint(equalToConstant: 170),
+
+            graphView.topAnchor.constraint(equalTo: heartbeatView.bottomAnchor, constant: 8),
             graphView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
             graphView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
-            graphView.heightAnchor.constraint(equalToConstant: 130),
+            graphView.heightAnchor.constraint(equalToConstant: 90),
 
             graphSpinner.centerXAnchor.constraint(equalTo: graphView.centerXAnchor),
             graphSpinner.centerYAnchor.constraint(equalTo: graphView.centerYAnchor)
