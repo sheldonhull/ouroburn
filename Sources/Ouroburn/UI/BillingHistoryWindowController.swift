@@ -13,13 +13,12 @@ final class BillingHistoryWindowController: NSWindowController {
     private let totalColumnID = NSUserInterfaceItemIdentifier("total")
     private let deltaColumnID = NSUserInterfaceItemIdentifier("delta")
     private let rateColumnID = NSUserInterfaceItemIdentifier("rate")
-    private let sourceColumnID = NSUserInterfaceItemIdentifier("source")
     private let dataSourceProxy = OutlineProxy()
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 600),
-            styleMask: [.titled, .closable, .resizable],
+            contentRect: NSRect(x: 0, y: 0, width: 880, height: 680),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
@@ -27,7 +26,7 @@ final class BillingHistoryWindowController: NSWindowController {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .visible
         window.backgroundColor = Theme.background
-        window.minSize = NSSize(width: 520, height: 360)
+        window.minSize = NSSize(width: 720, height: 480)
         window.isReleasedWhenClosed = false
         window.center()
 
@@ -57,47 +56,42 @@ final class BillingHistoryWindowController: NSWindowController {
         outline.usesAlternatingRowBackgroundColors = true
         outline.allowsColumnResizing = true
         outline.headerView = NSTableHeaderView()
-        outline.rowSizeStyle = .small
-        outline.indentationPerLevel = 12
+        outline.rowSizeStyle = .default
+        outline.rowHeight = 26
+        outline.indentationPerLevel = 16
         outline.autoresizesOutlineColumn = true
         outline.dataSource = dataSourceProxy
         outline.delegate = dataSourceProxy
         outline.gridStyleMask = [.solidHorizontalGridLineMask]
-        outline.intercellSpacing = NSSize(width: 8, height: 4)
+        outline.intercellSpacing = NSSize(width: 10, height: 6)
         outline.backgroundColor = Theme.background
         outline.style = .inset
         outline.translatesAutoresizingMaskIntoConstraints = false
 
         let timeColumn = NSTableColumn(identifier: timeColumnID)
         timeColumn.title = "Time"
-        timeColumn.minWidth = 110
-        timeColumn.width = 150
+        timeColumn.minWidth = 160
+        timeColumn.width = 220
         outline.addTableColumn(timeColumn)
         outline.outlineTableColumn = timeColumn
 
         let totalColumn = NSTableColumn(identifier: totalColumnID)
         totalColumn.title = "MTD"
-        totalColumn.minWidth = 80
-        totalColumn.width = 96
+        totalColumn.minWidth = 100
+        totalColumn.width = 130
         outline.addTableColumn(totalColumn)
 
         let deltaColumn = NSTableColumn(identifier: deltaColumnID)
         deltaColumn.title = "Δ"
-        deltaColumn.minWidth = 70
-        deltaColumn.width = 90
+        deltaColumn.minWidth = 90
+        deltaColumn.width = 120
         outline.addTableColumn(deltaColumn)
 
         let rateColumn = NSTableColumn(identifier: rateColumnID)
         rateColumn.title = "$/hr"
-        rateColumn.minWidth = 70
-        rateColumn.width = 90
+        rateColumn.minWidth = 90
+        rateColumn.width = 130
         outline.addTableColumn(rateColumn)
-
-        let sourceColumn = NSTableColumn(identifier: sourceColumnID)
-        sourceColumn.title = "Source"
-        sourceColumn.minWidth = 90
-        sourceColumn.width = 130
-        outline.addTableColumn(sourceColumn)
 
         let scroll = NSScrollView()
         scroll.documentView = outline
@@ -155,10 +149,16 @@ final class BillingHistoryWindowController: NSWindowController {
 
         dayRows = rows
         outline.reloadData()
-
-        // Auto-expand the most-recent day so the user sees today's samples without a click.
-        if let first = dayRows.first {
+        // Auto-expand the most-recent day so the user lands on today's samples without a click.
+        // Deferred to the next runloop tick because `expandItem(_:)` against an item that
+        // NSOutlineView hasn't yet materialized via `child(_:ofItem:)` is a no-op. After the
+        // reload tick the view has the same DayRow reference that the data source returns.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let first = dayRows.first else { return }
             outline.expandItem(first)
+            // Scroll the freshly-expanded day into view so the user sees today's samples even
+            // when the table has already accumulated a long history above it.
+            outline.scrollRowToVisible(0)
         }
     }
 
@@ -210,7 +210,7 @@ final class BillingHistoryWindowController: NSWindowController {
             return makeLabel(String(format: "$%.2f", row.latest), font: Theme.numericFont(size: 12),
                              color: Theme.accentMint)
         case deltaColumnID:
-            return makeLabel(String(format: "$%+.2f", row.dayDelta), font: Theme.numericFont(size: 12),
+            return makeLabel(String(format: "$%.2f", row.dayDelta), font: Theme.numericFont(size: 12),
                              color: deltaColor(value: row.dayDelta))
         case rateColumnID:
             // Day-level "$/hr" uses sample span / dollar delta for that day.
@@ -220,15 +220,11 @@ final class BillingHistoryWindowController: NSWindowController {
             {
                 let secs = lastSample.timestamp.timeIntervalSince(firstSample.timestamp)
                 let perHour = row.dayDelta * 3600 / secs
-                return makeLabel(String(format: "$%+.2f", perHour),
+                return makeLabel(String(format: "$%.2f", perHour),
                                  font: Theme.numericFont(size: 12),
                                  color: deltaColor(value: perHour))
             }
             return makeLabel("—", font: Theme.numericFont(size: 12), color: Theme.textTertiary)
-        case sourceColumnID:
-            return makeLabel("\(row.samples.count) samples",
-                             font: Theme.bodyFont(size: 11),
-                             color: Theme.textTertiary)
         default:
             return NSView()
         }
@@ -255,7 +251,7 @@ final class BillingHistoryWindowController: NSWindowController {
                 return makeLabel("—", font: Theme.numericFont(size: 11), color: Theme.textTertiary)
             }
             let delta = sample.totalUSD - prior.totalUSD
-            return makeLabel(String(format: "$%+.2f", delta),
+            return makeLabel(String(format: "$%.2f", delta),
                              font: Theme.numericFont(size: 11),
                              color: deltaColor(value: delta))
         case rateColumnID:
@@ -267,13 +263,9 @@ final class BillingHistoryWindowController: NSWindowController {
                 return makeLabel("—", font: Theme.numericFont(size: 11), color: Theme.textTertiary)
             }
             let perHour = (sample.totalUSD - prior.totalUSD) * 3600 / elapsed
-            return makeLabel(String(format: "$%+.2f", perHour),
+            return makeLabel(String(format: "$%.2f", perHour),
                              font: Theme.numericFont(size: 11),
                              color: deltaColor(value: perHour))
-        case sourceColumnID:
-            return makeLabel(sample.source,
-                             font: Theme.bodyFont(size: 10),
-                             color: Theme.textTertiary)
         default:
             return NSView()
         }
@@ -303,11 +295,21 @@ final class BillingHistoryWindowController: NSWindowController {
     }
 }
 
-private struct DayRow {
+/// Reference type so NSOutlineView can match `expandItem(_:)` against the same identity it
+/// hands back from `child(_:ofItem:)`. Earlier this was a struct — value-type identity broke
+/// auto-expand because each `child` call materialized a fresh copy.
+private final class DayRow {
     let day: Date
     let samples: [(sample: BillingSample, prior: BillingSample?)]
     let latest: Double
     let dayDelta: Double
+
+    init(day: Date, samples: [(sample: BillingSample, prior: BillingSample?)], latest: Double, dayDelta: Double) {
+        self.day = day
+        self.samples = samples
+        self.latest = latest
+        self.dayDelta = dayDelta
+    }
 }
 
 /// Outline view delegate + data source proxy. Kept private because NSOutlineView's protocols

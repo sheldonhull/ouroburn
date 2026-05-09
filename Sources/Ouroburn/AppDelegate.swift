@@ -2,6 +2,13 @@ import AppKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// ProjectPath roundtrips already encode `<project>/<session>` — for toast text we want just
+    /// the project's last meaningful segment so the message reads "top: ouroburn (1.2k TK/min)".
+    static func shortenSessionLabel(project: String) -> String {
+        let segments = ProjectPath.segments(project)
+        return segments.last ?? project
+    }
+
     private var statusBar: StatusBarController?
     private var tracker: BurnTracker?
     private var notifier: Notifier?
@@ -47,6 +54,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         tracker.onRefreshStateChanged = { [weak statusBar] state in
             DispatchQueue.main.async { statusBar?.setRefreshState(state) }
+        }
+        tracker.onLiveUpdate = { [weak statusBar] live in
+            DispatchQueue.main.async { statusBar?.applyLive(snapshot: live) }
+        }
+        tracker.onToast = { [weak tracker] event in
+            DispatchQueue.main.async {
+                let title = "Burn rate alert"
+                let session = event.topSession
+                let message: String = if let session, session.tokensPerMinute > 0 {
+                    String(
+                        format: "$%.2f/hr · top: %@ (%d TK/min)",
+                        event.costPerHour,
+                        Self.shortenSessionLabel(project: session.projectPath),
+                        Int(session.tokensPerMinute)
+                    )
+                } else {
+                    String(format: "Sustained > $%.2f/hr threshold", event.thresholdUSDPerHour)
+                }
+                ToastWindow.show(
+                    title: title,
+                    message: message,
+                    durationSeconds: tracker?.currentToastDurationSeconds() ?? 6
+                )
+            }
         }
         statusBar.onShowSettings = { [self] in
             Log.info(Log.app, "onShowSettings closure fired")

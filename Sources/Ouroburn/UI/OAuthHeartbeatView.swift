@@ -15,7 +15,6 @@ final class OAuthHeartbeatView: NSView {
     private var beats: [Beat] = []
 
     private let titleLabel = NSTextField(labelWithString: "")
-    private let summaryLabel = NSTextField(labelWithString: "")
     private let canvas = HeartbeatCanvas()
 
     override init(frame frameRect: NSRect) {
@@ -82,42 +81,18 @@ final class OAuthHeartbeatView: NSView {
             color: Theme.accentMint,
             font: Theme.titleFont(size: 12)
         )
-
-        guard let last = beats.last else {
-            summaryLabel.stringValue = samples.isEmpty
-                ? "no samples today"
-                : "waiting for next poll"
-            summaryLabel.textColor = Theme.textTertiary
-            summaryLabel.font = Theme.bodyFont(size: 10)
-            return
-        }
-
-        let todayDelta = beats.last!.mtd - (beats.first!.mtd - beats.first!.dollars)
-        summaryLabel.stringValue = String(
-            format: "$%+.2f today · MTD $%.2f",
-            max(0, todayDelta), last.mtd
-        )
-        summaryLabel.textColor = Theme.textTertiary
-        summaryLabel.font = Theme.numericFont(size: 10)
     }
 
     private func configureSubviews() {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        summaryLabel.translatesAutoresizingMaskIntoConstraints = false
-        summaryLabel.lineBreakMode = .byTruncatingTail
         canvas.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(titleLabel)
-        addSubview(summaryLabel)
         addSubview(canvas)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-
-            summaryLabel.firstBaselineAnchor.constraint(equalTo: titleLabel.firstBaselineAnchor),
-            summaryLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 10),
-            summaryLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
 
             canvas.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
             canvas.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
@@ -422,7 +397,7 @@ private final class HeartbeatTooltip: NSView {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d · HH:mm:ss"
         timeLabel.stringValue = formatter.string(from: beat.timestamp)
-        deltaLabel.stringValue = String(format: "Δ $%+.2f", beat.dollars)
+        deltaLabel.stringValue = String(format: "Δ $%.2f", beat.dollars)
         deltaLabel.textColor = accent
         mtdLabel.stringValue = String(format: "MTD $%.2f", beat.mtd)
     }

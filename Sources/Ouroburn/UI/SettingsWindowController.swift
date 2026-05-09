@@ -16,6 +16,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let cooldownField = NSTextField()
     private let oauthIntervalField = NSTextField()
     private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let toastEnabledSwitch = NSSwitch()
+    private let toastThresholdField = NSTextField()
+    private let toastSustainedField = NSTextField()
+    private let toastDurationField = NSTextField()
+    private let toastPreviewButton = NSButton(title: "Preview", target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: " ")
 
@@ -31,12 +36,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         self.onPreferencesSaved = onPreferencesSaved
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 680),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 820),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.minSize = NSSize(width: 640, height: 600)
+        window.minSize = NSSize(width: 640, height: 720)
         window.title = "ouroburn settings"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
@@ -91,9 +96,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
         let secretsCard = makeSecretsCard()
         let thresholdsCard = makeThresholdsCard()
+        let alertsCard = makeAlertsCard()
         let infoCard = makeInfoCard()
 
-        let stack = NSStackView(views: [secretsCard, thresholdsCard, infoCard])
+        let stack = NSStackView(views: [secretsCard, thresholdsCard, alertsCard, infoCard])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
@@ -313,6 +319,73 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         return card
     }
 
+    /// In-app toast alerts, separated from the macOS notification "spike" path. The Tuning card
+    /// drives the (existing) NSUserNotification; this card drives the floating in-app toast — two
+    /// distinct signals so users can run one without the other.
+    private func makeAlertsCard() -> NSView {
+        let card = card(
+            title: "Alerts",
+            subtitle: "Floating in-app toast when sustained $/hr crosses your threshold."
+        )
+
+        toastEnabledSwitch.translatesAutoresizingMaskIntoConstraints = false
+        toastEnabledSwitch.target = self
+        toastEnabledSwitch.action = #selector(toastEnabledChanged(_:))
+
+        toastThresholdField.translatesAutoresizingMaskIntoConstraints = false
+        toastThresholdField.placeholderString = "8.00"
+        toastThresholdField.alignment = .right
+
+        toastSustainedField.translatesAutoresizingMaskIntoConstraints = false
+        toastSustainedField.placeholderString = "30"
+        toastSustainedField.alignment = .right
+
+        toastDurationField.translatesAutoresizingMaskIntoConstraints = false
+        toastDurationField.placeholderString = "6"
+        toastDurationField.alignment = .right
+
+        toastPreviewButton.bezelStyle = .rounded
+        toastPreviewButton.controlSize = .small
+        toastPreviewButton.target = self
+        toastPreviewButton.action = #selector(previewToastPressed(_:))
+        toastPreviewButton.contentTintColor = Theme.accentPeach
+        toastPreviewButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [
+            inlineRow("Show toast", control: toastEnabledSwitch, hint: "fires only while ouroburn is running"),
+            inlineRow("Threshold ($/hr)", control: toastThresholdField, hint: "live USD/hr ≥ this"),
+            inlineRow("Sustained (s)", control: toastSustainedField, hint: "must hold for at least"),
+            inlineRow("Toast duration (s)", control: toastDurationField, hint: "auto-dismiss timer"),
+            inlineRow("Preview", control: toastPreviewButton, hint: "fires a sample toast now")
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 38),
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+        ])
+        return card
+    }
+
+    @objc private func toastEnabledChanged(_: Any?) {
+        // No-op: persistence happens on Save. Preview button stays usable regardless of state.
+    }
+
+    @objc private func previewToastPressed(_: Any?) {
+        let duration = Double(toastDurationField.stringValue) ?? Preferences.default.toastDurationSeconds
+        let threshold = Double(toastThresholdField.stringValue) ?? Preferences.default.toastCostThresholdUSDPerHour
+        ToastWindow.show(
+            title: "Burn rate alert (preview)",
+            message: String(format: "Sustained > $%.2f/hr threshold · sample toast", threshold),
+            durationSeconds: max(2, min(15, duration))
+        )
+    }
+
     private func makeInfoCard() -> NSView {
         let card = card(title: "Diagnostics", subtitle: nil)
         let label = NSTextField(wrappingLabelWithString: """
@@ -434,6 +507,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         minRateField.stringValue = String(Int(prefs.spikeMinimumRate))
         cooldownField.stringValue = String(Int(prefs.notificationCooldownSeconds))
         oauthIntervalField.stringValue = String(Int(prefs.oauthRefreshMinutes))
+        toastEnabledSwitch.state = prefs.toastEnabled ? .on : .off
+        toastThresholdField.stringValue = String(format: "%.2f", prefs.toastCostThresholdUSDPerHour)
+        toastSustainedField.stringValue = String(Int(prefs.toastSustainedSeconds))
+        toastDurationField.stringValue = String(Int(prefs.toastDurationSeconds))
         if let index = ViewMode.allCases.firstIndex(of: prefs.defaultMode) {
             modePopup.selectItem(at: index)
         }
@@ -452,13 +529,23 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let cooldown = Double(cooldownField.stringValue) ?? Preferences.default.notificationCooldownSeconds
         let oauthInterval = Double(oauthIntervalField.stringValue) ?? Preferences.default.oauthRefreshMinutes
         let mode = ViewMode.allCases[modePopup.indexOfSelectedItem]
+        let toastThreshold = Double(toastThresholdField.stringValue)
+            ?? Preferences.default.toastCostThresholdUSDPerHour
+        let toastSustained = Double(toastSustainedField.stringValue)
+            ?? Preferences.default.toastSustainedSeconds
+        let toastDuration = Double(toastDurationField.stringValue)
+            ?? Preferences.default.toastDurationSeconds
 
         let prefs = Preferences(
             spikeMultiplier: max(1.05, multiplier),
             spikeMinimumRate: max(0, minRate),
             defaultMode: mode,
             notificationCooldownSeconds: max(60, cooldown),
-            oauthRefreshMinutes: min(max(1, oauthInterval), 60)
+            oauthRefreshMinutes: min(max(1, oauthInterval), 60),
+            toastEnabled: toastEnabledSwitch.state == .on,
+            toastCostThresholdUSDPerHour: max(0.1, toastThreshold),
+            toastSustainedSeconds: min(max(5, toastSustained), 600),
+            toastDurationSeconds: min(max(2, toastDuration), 15)
         )
         PreferencesStore.save(prefs)
 

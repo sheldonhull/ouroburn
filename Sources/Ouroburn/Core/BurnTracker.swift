@@ -91,6 +91,36 @@ struct TrackerSnapshot: Sendable {
     }
 }
 
+/// Per-session live velocity sample: tokens-per-minute and projected USD/hr derived from the
+/// trailing 60s window. Emitted only while the popover is open so we don't pay incremental I/O
+/// in the background.
+struct SessionVelocity: Sendable, Equatable {
+    let projectPath: String
+    let sessionId: String
+    let tokensPerMinute: Double
+    let costPerHour: Double
+    let lastSampleAt: Date
+}
+
+/// Live snapshot delivered between full 60s ticks. Computed from incremental tail-reads of new
+/// JSONL bytes since the popover opened. Active only while the popover is shown.
+struct LiveSnapshot: Sendable {
+    let updatedAt: Date
+    let tokensPerMinute: Double
+    let costPerHour: Double
+    let perSession: [SessionVelocity]
+}
+
+/// Fires when the live USD/hr stays at or above the user's threshold for at least
+/// `Preferences.toastSustainedSeconds`. Carries the breach value plus the top session so the UI
+/// layer can render a "what's burning" message without re-deriving it.
+struct ToastEvent: Sendable {
+    let costPerHour: Double
+    let thresholdUSDPerHour: Double
+    let topSession: SessionVelocity?
+    let firstBreachAt: Date
+}
+
 /// Orchestrator: every 60 seconds, reload all transcripts, recompute aggregates for the active
 /// view mode, and emit a snapshot. Burn rate is the trailing 5-minute token sum projected to a
 /// per-minute number — independent of the chosen view mode.
@@ -98,21 +128,31 @@ final class BurnTracker: @unchecked Sendable {
     var onUpdate: ((TrackerSnapshot) -> Void)?
     var onSpike: ((TrackerSnapshot) -> Void)?
     var onRefreshStateChanged: ((RefreshState) -> Void)?
+    /// Fires every `liveTickInterval` while the popover is shown. Replaces nothing — strictly
+    /// additive over the 60s `onUpdate` snapshot.
+    var onLiveUpdate: ((LiveSnapshot) -> Void)?
+    /// Fires once per breach when live USD/hr stays at/above threshold for the sustained window.
+    /// Cooldown of `notificationCooldownSeconds` applies between fires.
+    var onToast: ((ToastEvent) -> Void)?
 
     static let pollInterval: TimeInterval = 60
     static let burnWindowSeconds: TimeInterval = 5 * 60
     static let billingTickInterval: TimeInterval = 30
     static let spikeMultiplierDefault: Double = 2.0
     static let spikeMinimumRateDefault: Double = 500
+    static let liveTickInterval: TimeInterval = 2
+    static let liveWindowSeconds: TimeInterval = 60
 
     private let loader: JSONLLoader
     private let pricingService: PricingService
     private let billingService: BillingService?
     private let cache: DiskCache
     private let queue = DispatchQueue(label: "ouroburn.burn-tracker", qos: .utility)
+    private let liveQueue = DispatchQueue(label: "ouroburn.burn-tracker.live", qos: .userInitiated)
     private let state = OSAllocatedUnfairLock<State>(initialState: State())
     private var timer: DispatchSourceTimer?
     private var billingTimer: DispatchSourceTimer?
+    private var liveTimer: DispatchSourceTimer?
 
     private struct State {
         var pricingTable: [String: ModelPricing] = [:]
@@ -131,15 +171,58 @@ final class BurnTracker: @unchecked Sendable {
         // Tunable spike thresholds. Updated when the user saves settings.
         var spikeMultiplier: Double = BurnTracker.spikeMultiplierDefault
         var spikeMinimumRate: Double = BurnTracker.spikeMinimumRateDefault
+        /// Tail-read offsets per file. Seeded at file size when live tracking starts so the live
+        /// view shows only activity that occurs while the popover is open.
+        var liveOffsets: [URL: UInt64] = [:]
+        /// Rolling 60s window of new entries observed since live tracking started. Trimmed on
+        /// every tick. Empty when popover is closed.
+        var liveSamples: [UsageEntry] = []
+        /// Toast threshold tunables, mirrored from `Preferences` on apply.
+        var toastEnabled: Bool = false
+        var toastCostThreshold: Double = 8
+        var toastSustainedSeconds: Double = 30
+        var toastDurationSeconds: Double = 6
+        var notificationCooldownSeconds: Double = 600
+        /// First moment the live rate exceeded `toastCostThreshold` in the current breach window.
+        /// Reset whenever the rate drops back below. Once `now - firstBreach >= sustained`, the
+        /// `onToast` callback fires and `lastToastFiredAt` advances to enforce cooldown.
+        var firstBreachAt: Date?
+        var lastToastFiredAt: Date?
     }
 
     func applyPreferences(_ prefs: Preferences) {
         state.withLock {
             $0.spikeMultiplier = prefs.spikeMultiplier
             $0.spikeMinimumRate = prefs.spikeMinimumRate
+            $0.toastEnabled = prefs.toastEnabled
+            $0.toastCostThreshold = prefs.toastCostThresholdUSDPerHour
+            $0.toastSustainedSeconds = prefs.toastSustainedSeconds
+            $0.toastDurationSeconds = prefs.toastDurationSeconds
+            $0.notificationCooldownSeconds = prefs.notificationCooldownSeconds
+            // Threshold or enabled flag changed — reset the breach tracker so the next breach
+            // starts fresh rather than firing on stale state.
+            $0.firstBreachAt = nil
         }
         if let billingService {
             Task { await billingService.setPollInterval(minutes: prefs.oauthRefreshMinutes) }
+        }
+    }
+
+    /// Convenience for the UI layer (settings preview button) — current toast duration.
+    func currentToastDurationSeconds() -> Double {
+        state.withLock { $0.toastDurationSeconds }
+    }
+
+    /// Toggles the OAuth billing foreground boost. Called when the popover opens/closes so the
+    /// monthly tile keeps near-real-time pace without changing the user's saved cadence. Cooldown
+    /// + 429 backoff still gate the actual upstream fetch.
+    func setBillingForegroundActive(_ active: Bool) {
+        guard let billingService else { return }
+        Task { await billingService.setForegroundActive(active) }
+        if active {
+            // Trigger an immediate billing tick so the user sees a fresh number on open instead
+            // of waiting up to 30s for the next regular billing tick.
+            queue.async { [weak self] in self?.fetchBilling() }
         }
     }
 
@@ -207,7 +290,10 @@ final class BurnTracker: @unchecked Sendable {
             monthCostUSD: cached.monthCostUSD ?? 0,
             updatedAt: cached.savedAt,
             spikeDetected: cached.recentSpike,
-            stale: true,
+            // Stale only when the cached snapshot is older than two poll cycles. Fresh caches
+            // already carry per-mode buckets + timelines, so we should render them immediately
+            // instead of forcing the popover into a "loading…" state on every relaunch.
+            stale: Date().timeIntervalSince(cached.savedAt) > Self.pollInterval * 2,
             billedMonthUSD: cached.billedMonthUSD,
             billingStatusMessage: nil
         )
@@ -259,6 +345,174 @@ final class BurnTracker: @unchecked Sendable {
         }
         queue.async { [weak self] in self?.poll() }
         queue.async { [weak self] in self?.fetchBilling() }
+    }
+
+    /// Starts the 2s live ticker. Tail-reads only new JSONL bytes; rolling 60s window. Cheap
+    /// because it walks file sizes without parsing existing content. Caller (status bar) invokes
+    /// this on popover-open and pairs it with `stopLiveTracking()` on close.
+    /// Seed offsets + start the 2s timer. Runs synchronously on the caller's thread (main, when
+    /// invoked from the popover-open path). Earlier versions bounced between `liveQueue.async`
+    /// and `DispatchQueue.main.async`, which crashed under Swift 6 strict-concurrency isolation
+    /// checks when called from a `@MainActor` context.
+    func startLiveTracking() {
+        let files = loader.transcriptFiles()
+        let seeded: [URL: UInt64] = files.reduce(into: [:]) { acc, url in
+            acc[url] = loader.currentSize(of: url)
+        }
+        state.withLock { state in
+            state.liveOffsets = seeded
+            state.liveSamples = []
+            state.firstBreachAt = nil
+        }
+
+        liveTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: liveQueue)
+        timer.schedule(
+            deadline: .now() + Self.liveTickInterval,
+            repeating: Self.liveTickInterval
+        )
+        timer.setEventHandler { [weak self] in self?.liveTick() }
+        timer.resume()
+        liveTimer = timer
+    }
+
+    func stopLiveTracking() {
+        liveTimer?.cancel()
+        liveTimer = nil
+        state.withLock { state in
+            state.liveOffsets = [:]
+            state.liveSamples = []
+            state.firstBreachAt = nil
+        }
+    }
+
+    private func liveTick() {
+        let cutoff = Date().addingTimeInterval(-Self.liveWindowSeconds)
+        let snapshot = state.withLock { state in
+            (state.liveOffsets, state.pricingTable)
+        }
+        let offsets = snapshot.0
+        let table = snapshot.1
+
+        // Discover new files that appeared since the popover opened — seed those at their current
+        // size so we don't accidentally back-fill historical content.
+        let currentFiles = loader.transcriptFiles()
+        var nextOffsets = offsets
+        var newEntries: [UsageEntry] = []
+        for url in currentFiles {
+            if let priorOffset = offsets[url] {
+                let (entries, advanced) = loader.loadIncremental(from: url, fromOffset: priorOffset)
+                nextOffsets[url] = advanced
+                newEntries.append(contentsOf: entries)
+            } else {
+                nextOffsets[url] = loader.currentSize(of: url)
+            }
+        }
+
+        let appended = newEntries
+        let nextOffsetsFinal = nextOffsets
+        let now = Date()
+        let (live, toastEvent) = state.withLock { state -> (LiveSnapshot, ToastEvent?) in
+            // Append, trim, then aggregate. Cheap because the live buffer caps at 60s of activity.
+            state.liveSamples.append(contentsOf: appended)
+            state.liveSamples.removeAll { $0.timestamp < cutoff }
+            state.liveOffsets = nextOffsetsFinal
+            let snapshot = Self.computeLive(samples: state.liveSamples, table: table, now: now)
+
+            // Threshold tracker: only meaningful while toast alerts are enabled and we have at
+            // least one sample in the rolling window — empty windows produce a 0 rate that would
+            // otherwise reset breach state every tick.
+            guard state.toastEnabled, !state.liveSamples.isEmpty else {
+                state.firstBreachAt = nil
+                return (snapshot, nil)
+            }
+            if snapshot.costPerHour >= state.toastCostThreshold {
+                let firstBreach = state.firstBreachAt ?? now
+                state.firstBreachAt = firstBreach
+                let sustainedFor = now.timeIntervalSince(firstBreach)
+                let cooldownOK: Bool = if let last = state.lastToastFiredAt {
+                    now.timeIntervalSince(last) >= state.notificationCooldownSeconds
+                } else {
+                    true
+                }
+                if sustainedFor >= state.toastSustainedSeconds, cooldownOK {
+                    state.lastToastFiredAt = now
+                    let event = ToastEvent(
+                        costPerHour: snapshot.costPerHour,
+                        thresholdUSDPerHour: state.toastCostThreshold,
+                        topSession: snapshot.perSession.first,
+                        firstBreachAt: firstBreach
+                    )
+                    return (snapshot, event)
+                }
+                return (snapshot, nil)
+            } else {
+                state.firstBreachAt = nil
+                return (snapshot, nil)
+            }
+        }
+        onLiveUpdate?(live)
+        if let toastEvent { onToast?(toastEvent) }
+    }
+
+    private static func liveCost(for entry: UsageEntry, table: [String: ModelPricing]) -> Double {
+        if let cost = entry.costUSD { return cost }
+        return PricingResolver.resolve(model: entry.model, table: table)?.cost(for: entry) ?? 0
+    }
+
+    /// Pure aggregation: rolling-window samples → tokens/min + USD/hr + per-session ranking.
+    /// Pulled out so it stays unit-testable without spinning up the timer.
+    private static func computeLive(
+        samples: [UsageEntry],
+        table: [String: ModelPricing],
+        now: Date
+    ) -> LiveSnapshot {
+        guard !samples.isEmpty else {
+            return LiveSnapshot(updatedAt: now, tokensPerMinute: 0, costPerHour: 0, perSession: [])
+        }
+
+        let totalTokens = samples.reduce(0) {
+            $0 + $1.inputTokens + $1.outputTokens + $1.cacheCreationTokens + $1.cacheReadTokens
+        }
+        let totalCost = samples.reduce(0.0) {
+            $0 + Self.liveCost(for: $1, table: table)
+        }
+        let windowMinutes = liveWindowSeconds / 60.0
+        let tpm = Double(totalTokens) / windowMinutes
+        let cph = totalCost / windowMinutes * 60
+
+        struct Bucket {
+            var tokens = 0
+            var cost = 0.0
+            var lastSampleAt: Date = .distantPast
+        }
+        var perSession: [String: Bucket] = [:]
+        for entry in samples {
+            let project = entry.projectPath ?? "?"
+            let session = entry.sessionId ?? "?"
+            let key = "\(project)\u{0}\(session)"
+            var bucket = perSession[key] ?? Bucket()
+            bucket.tokens += entry.inputTokens + entry.outputTokens
+                + entry.cacheCreationTokens + entry.cacheReadTokens
+            bucket.cost += Self.liveCost(for: entry, table: table)
+            if entry.timestamp > bucket.lastSampleAt { bucket.lastSampleAt = entry.timestamp }
+            perSession[key] = bucket
+        }
+
+        let velocities = perSession.compactMap { key, bucket -> SessionVelocity? in
+            let parts = key.split(separator: "\u{0}", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { return nil }
+            return SessionVelocity(
+                projectPath: String(parts[0]),
+                sessionId: String(parts[1]),
+                tokensPerMinute: Double(bucket.tokens) / windowMinutes,
+                costPerHour: bucket.cost / windowMinutes * 60,
+                lastSampleAt: bucket.lastSampleAt
+            )
+        }
+        .sorted { $0.tokensPerMinute > $1.tokensPerMinute }
+
+        return LiveSnapshot(updatedAt: now, tokensPerMinute: tpm, costPerHour: cph, perSession: velocities)
     }
 
     /// Async billing fetch decoupled from the session poll. Updates the snapshot in place so the

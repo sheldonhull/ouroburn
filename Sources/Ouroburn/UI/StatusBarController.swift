@@ -61,6 +61,10 @@ final class StatusBarController {
         }
     }
 
+    func applyLive(snapshot: LiveSnapshot) {
+        metrics.applyLive(snapshot: snapshot)
+    }
+
     func setRefreshState(_ state: RefreshState) {
         metrics.setRefreshState(state)
         if let button = item.button, state.isRefreshing {
@@ -81,9 +85,20 @@ final class StatusBarController {
         guard let button = item.button else { return }
         if popover.isShown {
             popover.performClose(nil)
+            tracker.stopLiveTracking()
+            tracker.setBillingForegroundActive(false)
         } else {
+            // Refresh the live priority panel from the cached snapshot before the popover slides
+            // in so the OAuth heartbeat + top-5 sessions read fresh on every open.
+            metrics.popoverWillShow()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
+            // Tail-read JSONLs every 2s while the popover is visible. Stops on close so we don't
+            // pay incremental I/O when nobody is looking at the numbers.
+            tracker.startLiveTracking()
+            // Bump OAuth billing cadence to a 60s floor while the popover is open. Cooldown +
+            // upstream 429 backoff still apply — this just shortens the *baseline*.
+            tracker.setBillingForegroundActive(true)
         }
     }
 

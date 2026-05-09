@@ -48,7 +48,11 @@ final class RefreshBanner: NSView {
     }
 
     func setState(_ state: RefreshState) {
-        if state.isRefreshing {
+        // Routine 60s polls are surfaced by the pulse orb in the hero panel — surfacing them
+        // again as a footer chip just adds visual noise. Show the chip only for the first cold
+        // load (the multi-minute parse) so the user sees *why* the popover is empty on launch.
+        let isColdStart = state.message.lowercased().contains("first")
+        if state.isRefreshing, isColdStart {
             label.stringValue = shortMessage(from: state.message)
             spinner.startAnimation(nil)
             isHidden = false

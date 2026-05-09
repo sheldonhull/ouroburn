@@ -10,6 +10,12 @@ struct Preferences: Sendable {
     /// Baseline interval (minutes) between Anthropic OAuth spend pulls. Floors at 1, ceilings at
     /// 60. Failed fetches escalate up to `oauthRefreshMaxMinutes` via exponential backoff.
     var oauthRefreshMinutes: Double
+    /// In-app toast alert when the live USD/hr stays above `toastCostThresholdUSDPerHour` for
+    /// at least `toastSustainedSeconds`. Independent of the macOS notification spike path.
+    var toastEnabled: Bool
+    var toastCostThresholdUSDPerHour: Double
+    var toastSustainedSeconds: Double
+    var toastDurationSeconds: Double
     static let oauthRefreshMaxMinutes: Double = 15
 
     static let `default` = Preferences(
@@ -17,7 +23,11 @@ struct Preferences: Sendable {
         spikeMinimumRate: 500,
         defaultMode: .day,
         notificationCooldownSeconds: 600,
-        oauthRefreshMinutes: 5
+        oauthRefreshMinutes: 5,
+        toastEnabled: false,
+        toastCostThresholdUSDPerHour: 8,
+        toastSustainedSeconds: 30,
+        toastDurationSeconds: 6
     )
 }
 
@@ -30,6 +40,10 @@ enum PreferencesStore {
         static let defaultMode = "ouroburn.defaultMode"
         static let notificationCooldown = "ouroburn.notificationCooldown"
         static let oauthRefreshMinutes = "ouroburn.oauthRefreshMinutes"
+        static let toastEnabled = "ouroburn.toastEnabled"
+        static let toastThreshold = "ouroburn.toastCostThresholdUSDPerHour"
+        static let toastSustained = "ouroburn.toastSustainedSeconds"
+        static let toastDuration = "ouroburn.toastDurationSeconds"
     }
 
     static func load() -> Preferences {
@@ -51,6 +65,18 @@ enum PreferencesStore {
         if defaults.object(forKey: Key.oauthRefreshMinutes) != nil {
             prefs.oauthRefreshMinutes = defaults.double(forKey: Key.oauthRefreshMinutes)
         }
+        if defaults.object(forKey: Key.toastEnabled) != nil {
+            prefs.toastEnabled = defaults.bool(forKey: Key.toastEnabled)
+        }
+        if defaults.object(forKey: Key.toastThreshold) != nil {
+            prefs.toastCostThresholdUSDPerHour = defaults.double(forKey: Key.toastThreshold)
+        }
+        if defaults.object(forKey: Key.toastSustained) != nil {
+            prefs.toastSustainedSeconds = defaults.double(forKey: Key.toastSustained)
+        }
+        if defaults.object(forKey: Key.toastDuration) != nil {
+            prefs.toastDurationSeconds = defaults.double(forKey: Key.toastDuration)
+        }
         return prefs
     }
 
@@ -60,6 +86,10 @@ enum PreferencesStore {
         defaults.set(prefs.defaultMode.rawValue, forKey: Key.defaultMode)
         defaults.set(prefs.notificationCooldownSeconds, forKey: Key.notificationCooldown)
         defaults.set(prefs.oauthRefreshMinutes, forKey: Key.oauthRefreshMinutes)
+        defaults.set(prefs.toastEnabled, forKey: Key.toastEnabled)
+        defaults.set(prefs.toastCostThresholdUSDPerHour, forKey: Key.toastThreshold)
+        defaults.set(prefs.toastSustainedSeconds, forKey: Key.toastSustained)
+        defaults.set(prefs.toastDurationSeconds, forKey: Key.toastDuration)
     }
 }
 

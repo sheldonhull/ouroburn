@@ -20,6 +20,8 @@ final class MetricsViewController: NSViewController {
     private let segmented = NSSegmentedControl()
     private let heartbeatView = OAuthHeartbeatView()
     private let heartbeatStore = BillingSampleStore()
+    private let topSessionsView = TopSessionsView()
+    private let sectionDivider = SectionDivider()
     private let graphView = LineGraphView()
     private let graphSpinner = PaneSpinner(message: "Building timeline…")
     private let listSpinner = PaneSpinner(message: "Parsing transcripts…")
@@ -34,7 +36,10 @@ final class MetricsViewController: NSViewController {
     private var lastRenderedMode: ViewMode = .day
     private var lastRenderedRowIDs: [String] = []
     private var expandedRowIDs = Set<String>()
+    private var expandedProjectIDs = Set<String>()
+    private var didAutoExpandTodayForMode: [ViewMode: Bool] = [:]
     private var displayedMode: ViewMode = .day
+    private let pulseOrb = PulseOrb()
 
     /// Hard cap on rows rendered into the popover. Session view alone can produce 1k+ rows;
     /// rebuilding that many NSViews on every snapshot pegs the main thread. Rows beyond this
@@ -43,7 +48,7 @@ final class MetricsViewController: NSViewController {
 
     /// Popover content size is pinned so that switching into Session view (whose long encoded
     /// project paths previously stretched the row labels) no longer reflows the popover frame.
-    private static let contentSize = NSSize(width: 560, height: 640)
+    private static let contentSize = NSSize(width: 580, height: 840)
 
     override func loadView() {
         let root = NSView(frame: NSRect(origin: .zero, size: Self.contentSize))
@@ -59,6 +64,7 @@ final class MetricsViewController: NSViewController {
         preferredContentSize = Self.contentSize
 
         configureHero()
+        configurePriorityPanel()
         configureSegmented()
         configureGraph()
         configureBody()
@@ -70,6 +76,10 @@ final class MetricsViewController: NSViewController {
 
     func setRefreshState(_ state: RefreshState) {
         refreshBanner.setState(state)
+        // Visual heartbeat: every poll cycle the tracker flips isRefreshing true → false.
+        // Pulse on the rising edge so the user gets a single satisfying blip per cycle, not a
+        // continuous animation.
+        if state.isRefreshing { pulseOrb.pulse() }
     }
 
     enum ConnectionState: Equatable {
@@ -148,13 +158,45 @@ final class MetricsViewController: NSViewController {
 
         renderHero(snapshot: snapshot)
         renderHeartbeat()
+        renderTopSessions(snapshot: snapshot)
         renderGraph(snapshot: snapshot)
         renderListIfChanged(snapshot: snapshot)
         renderFooter(snapshot: snapshot)
     }
 
+    /// Called when the popover transitions from hidden to shown. Re-renders the live priority
+    /// panel from the snapshot we already hold so the user sees fresh data on every open without
+    /// waiting for the next 60s tick.
+    func popoverWillShow() {
+        guard let snapshot else { return }
+        renderHero(snapshot: snapshot)
+        renderHeartbeat()
+        renderTopSessions(snapshot: snapshot)
+    }
+
+    /// Live tick (~2s while popover open). Overlays the hero USD/hr with the rolling-60s value
+    /// and re-ranks the top-5 sessions by current tokens/min. Replaces nothing in the buckets/
+    /// timeline data — those still come from the 60s snapshot.
+    func applyLive(snapshot live: LiveSnapshot) {
+        // Hero USD/hr — only override when there's actual live activity, otherwise keep the 5-min
+        // projected number from the latest snapshot.
+        if live.tokensPerMinute > 0 {
+            headlineCost.attributedStringValue = Theme.glowAttributedTitle(
+                String(format: "~$%.2f / hr · live", live.costPerHour),
+                color: Theme.accentMint,
+                font: Theme.titleFont(size: 18)
+            )
+        }
+        topSessionsView.applyLive(velocities: live.perSession)
+    }
+
     private func renderHeartbeat() {
         heartbeatView.update(samples: heartbeatStore.load())
+    }
+
+    private func renderTopSessions(snapshot: TrackerSnapshot) {
+        let buckets = snapshot.bucketsByMode[.session] ?? []
+        topSessionsView.update(buckets: buckets)
     }
 
     @objc private func segmentChanged(_ sender: NSSegmentedControl) {
@@ -246,7 +288,9 @@ final class MetricsViewController: NSViewController {
             ? Theme.accentMint
             : rateColor(rate: snapshot.medianTokensPerMinute)
         graphView.update(points: timeline, accent: accent, metric: metric)
-        graphSpinner.setLoading(snapshot.stale && timeline.isEmpty)
+        // Pulse orb in the hero already signals "we're working" on every tick. The pane spinners
+        // were redundant noise that camped on the popover whenever a mode had no data.
+        graphSpinner.setLoading(false)
     }
 
     private func renderFooter(snapshot: TrackerSnapshot) {
@@ -260,7 +304,10 @@ final class MetricsViewController: NSViewController {
         let buckets = snapshot.bucketsByMode[displayedMode] ?? []
         let ids = buckets.prefix(rowRenderCap).map(\.id)
         let same = ids == lastRenderedRowIDs && lastRenderedMode == displayedMode
-        listSpinner.setLoading(snapshot.stale && buckets.isEmpty)
+        // Spinner suppressed: pulse orb handles the "still working" signal, and the empty-state
+        // card surfaces the "no data yet" message when buckets are genuinely empty.
+        listSpinner.setLoading(false)
+        autoExpandTodayIfNeeded(mode: displayedMode, buckets: buckets)
         if same, !force {
             updateRowsInPlace(buckets: buckets)
             return
@@ -268,6 +315,24 @@ final class MetricsViewController: NSViewController {
         lastRenderedMode = displayedMode
         lastRenderedRowIDs = ids
         renderRows(buckets)
+    }
+
+    /// First time we render a non-empty list for a given mode, expand the bucket that represents
+    /// "today" (or the most-recent bucket as a proxy when no `start` date is on the bucket). This
+    /// lines up with how the user actually reads the popover — they almost always want to drill
+    /// into the current day on open without an extra click.
+    private func autoExpandTodayIfNeeded(mode: ViewMode, buckets: [AggregateBucket]) {
+        guard didAutoExpandTodayForMode[mode] != true, !buckets.isEmpty else { return }
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let target = buckets.first(where: { bucket in
+            guard let start = bucket.start else { return false }
+            return calendar.isDate(start, inSameDayAs: today)
+        }) ?? buckets.first
+        if let target {
+            expandedRowIDs.insert(target.id)
+        }
+        didAutoExpandTodayForMode[mode] = true
     }
 
     private func configureHero() {
@@ -287,7 +352,10 @@ final class MetricsViewController: NSViewController {
         rateStack.spacing = 0
         rateStack.translatesAutoresizingMaskIntoConstraints = false
 
-        let topRow = NSStackView(views: [rateStack, NSView(), headlineCost])
+        pulseOrb.translatesAutoresizingMaskIntoConstraints = false
+        pulseOrb.toolTip = "Pulses on every refresh tick"
+
+        let topRow = NSStackView(views: [rateStack, pulseOrb, NSView(), headlineCost])
         topRow.orientation = .horizontal
         topRow.alignment = .firstBaseline
         topRow.distribution = .fill
@@ -340,27 +408,51 @@ final class MetricsViewController: NSViewController {
         segmented.selectedSegment = 0
         view.addSubview(segmented)
 
+        // Pinned below the section divider — drill-down controls live below the priority panel.
         NSLayoutConstraint.activate([
-            segmented.topAnchor.constraint(equalTo: monthTile.bottomAnchor, constant: 18),
+            segmented.topAnchor.constraint(equalTo: sectionDivider.bottomAnchor, constant: 10),
             segmented.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
             segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18)
         ])
     }
 
-    private func configureGraph() {
+    /// Top section: OAuth heartbeat (the most-watched live signal) + iStat-style top-5 sessions
+    /// panel, separated from the drill-down rows by a divider. Both views refresh whenever the
+    /// popover opens so the live region feels near-real-time without paying that cost in the
+    /// background tick.
+    private func configurePriorityPanel() {
         heartbeatView.translatesAutoresizingMaskIntoConstraints = false
-        graphView.translatesAutoresizingMaskIntoConstraints = false
-        graphSpinner.translatesAutoresizingMaskIntoConstraints = false
+        topSessionsView.translatesAutoresizingMaskIntoConstraints = false
+        sectionDivider.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(heartbeatView)
-        view.addSubview(graphView)
-        view.addSubview(graphSpinner)
+        view.addSubview(topSessionsView)
+        view.addSubview(sectionDivider)
+
         NSLayoutConstraint.activate([
-            heartbeatView.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 10),
+            heartbeatView.topAnchor.constraint(equalTo: monthTile.bottomAnchor, constant: 14),
             heartbeatView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
             heartbeatView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
             heartbeatView.heightAnchor.constraint(equalToConstant: 170),
 
-            graphView.topAnchor.constraint(equalTo: heartbeatView.bottomAnchor, constant: 8),
+            topSessionsView.topAnchor.constraint(equalTo: heartbeatView.bottomAnchor, constant: 8),
+            topSessionsView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            topSessionsView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+            topSessionsView.heightAnchor.constraint(equalToConstant: 130),
+
+            sectionDivider.topAnchor.constraint(equalTo: topSessionsView.bottomAnchor, constant: 8),
+            sectionDivider.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            sectionDivider.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+            sectionDivider.heightAnchor.constraint(equalToConstant: 14)
+        ])
+    }
+
+    private func configureGraph() {
+        graphView.translatesAutoresizingMaskIntoConstraints = false
+        graphSpinner.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(graphView)
+        view.addSubview(graphSpinner)
+        NSLayoutConstraint.activate([
+            graphView.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 8),
             graphView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
             graphView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
             graphView.heightAnchor.constraint(equalToConstant: 90),
@@ -451,7 +543,9 @@ final class MetricsViewController: NSViewController {
     }
 
     /// Session view: collapse the shared path segments into a single dim header and group
-    /// buckets by project so each repo appears once with its sessions indented underneath.
+    /// buckets by project. Each project renders as a clickable summary row (chevron + summed
+    /// tokens/cost) and stays collapsed by default; sessions only render when the user expands
+    /// the project. Mirrors the day/week/month rows so users get one extra grouping layer.
     private func renderSessionTree(_ buckets: [AggregateBucket]) {
         struct Item { let bucket: AggregateBucket; let segments: [String]; let session: String }
 
@@ -499,7 +593,18 @@ final class MetricsViewController: NSViewController {
         for key in sortedKeys {
             guard let tail = groupTails[key] else { continue }
             let group = groupItems[key] ?? []
-            appendProjectHeader(tail: tail, sessionCount: group.count)
+            let totals = projectTotals(group.map(\.bucket))
+            let isExpanded = expandedProjectIDs.contains(key)
+            appendProjectGroupRow(
+                key: key,
+                tail: tail,
+                sessionCount: group.count,
+                totalTokens: totals.tokens,
+                totalCost: totals.cost,
+                anyActive: totals.anyActive,
+                expanded: isExpanded
+            )
+            guard isExpanded else { continue }
             for item in group {
                 if rendered >= rowRenderCap { break }
                 appendBucketRow(bucket: item.bucket, displayKey: shortSession(item.session), indent: 18)
@@ -507,9 +612,24 @@ final class MetricsViewController: NSViewController {
             }
             if rendered >= rowRenderCap { break }
         }
-        if items.count > rendered {
-            appendOverflowRow(hidden: items.count - rendered)
+        let visibleSessions = sortedKeys.reduce(0) { acc, key in
+            expandedProjectIDs.contains(key) ? acc + (groupItems[key]?.count ?? 0) : acc
         }
+        if visibleSessions > rendered {
+            appendOverflowRow(hidden: visibleSessions - rendered)
+        }
+    }
+
+    private func projectTotals(_ buckets: [AggregateBucket]) -> (tokens: Int, cost: Double, anyActive: Bool) {
+        var tokens = 0
+        var cost = 0.0
+        var active = false
+        for bucket in buckets {
+            tokens += bucket.totalTokens
+            cost += bucket.costUSD
+            if bucket.isActive { active = true }
+        }
+        return (tokens, cost, active)
     }
 
     private func appendBucketRow(bucket: AggregateBucket, displayKey: String? = nil, indent: CGFloat = 0) {
@@ -555,37 +675,32 @@ final class MetricsViewController: NSViewController {
         wrapper.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -8).isActive = true
     }
 
-    private func appendProjectHeader(tail: [String], sessionCount: Int) {
-        let title = NSTextField(labelWithString: tail.joined(separator: "/"))
-        title.font = Theme.titleFont(size: 12)
-        title.textColor = Theme.textSecondary
-        title.lineBreakMode = .byTruncatingMiddle
-        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        title.translatesAutoresizingMaskIntoConstraints = false
-
-        let count = NSTextField(labelWithString: "\(sessionCount)")
-        count.font = Theme.numericFont(size: 10)
-        count.textColor = Theme.textTertiary
-        count.translatesAutoresizingMaskIntoConstraints = false
-
-        let row = NSStackView(views: [title, NSView(), count])
-        row.orientation = .horizontal
-        row.alignment = .firstBaseline
-        row.distribution = .fill
-        row.spacing = 8
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        let wrapper = NSView()
-        wrapper.translatesAutoresizingMaskIntoConstraints = false
-        wrapper.addSubview(row)
-        NSLayoutConstraint.activate([
-            row.topAnchor.constraint(equalTo: wrapper.topAnchor, constant: 6),
-            row.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor, constant: 6),
-            row.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor, constant: -6),
-            row.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor, constant: -2)
-        ])
-        stack.addArrangedSubview(wrapper)
-        wrapper.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -8).isActive = true
+    private func appendProjectGroupRow(
+        key: String,
+        tail: [String],
+        sessionCount: Int,
+        totalTokens: Int,
+        totalCost: Double,
+        anyActive: Bool,
+        expanded: Bool
+    ) {
+        let row = ProjectGroupRowView(
+            key: key,
+            title: tail.joined(separator: "/"),
+            sessionCount: sessionCount,
+            totalTokens: totalTokens,
+            totalCost: totalCost,
+            anyActive: anyActive,
+            expanded: expanded
+        )
+        row.onToggle = { [weak self] groupKey in
+            guard let self else { return }
+            if expandedProjectIDs.contains(groupKey) { expandedProjectIDs.remove(groupKey) }
+            else { expandedProjectIDs.insert(groupKey) }
+            if let snapshot { renderListIfChanged(snapshot: snapshot, force: true) }
+        }
+        stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -8).isActive = true
     }
 
     private func appendOverflowRow(hidden: Int) {
@@ -924,7 +1039,7 @@ private final class BucketRowView: NSView {
         let titleString = bucket.isGap ? "— gap —"
             : (bucket.isActive ? "● \(baseKey)" : baseKey)
         let title = NSTextField(labelWithString: titleString)
-        title.font = Theme.titleFont(size: 13)
+        title.font = Theme.titleFont(size: 14)
         title.textColor = primaryColor
         title.lineBreakMode = .byTruncatingMiddle
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -933,18 +1048,18 @@ private final class BucketRowView: NSView {
             title.attributedStringValue = Theme.glowAttributedTitle(
                 titleString,
                 color: primaryColor,
-                font: Theme.titleFont(size: 13)
+                font: Theme.titleFont(size: 14)
             )
         }
         title.translatesAutoresizingMaskIntoConstraints = false
 
         let tokens = NSTextField(labelWithString: "\(BurnFormatting.compactTokens(bucket.totalTokens)) TK")
-        tokens.font = Theme.numericFont(size: 12)
+        tokens.font = Theme.numericFont(size: 13)
         tokens.textColor = Theme.textSecondary
         tokens.translatesAutoresizingMaskIntoConstraints = false
 
         let cost = NSTextField(labelWithString: String(format: "$%.2f", bucket.costUSD))
-        cost.font = Theme.numericFont(size: 12)
+        cost.font = Theme.numericFont(size: 13)
         cost.textColor = Theme.accentMint
         cost.translatesAutoresizingMaskIntoConstraints = false
 
@@ -971,9 +1086,9 @@ private final class BucketRowView: NSView {
 
         addSubview(row)
         NSLayoutConstraint.activate([
-            row.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12)
+            row.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14)
         ])
 
         if expanded {
@@ -981,13 +1096,13 @@ private final class BucketRowView: NSView {
             expansion.translatesAutoresizingMaskIntoConstraints = false
             addSubview(expansion)
             NSLayoutConstraint.activate([
-                expansion.topAnchor.constraint(equalTo: row.bottomAnchor, constant: 8),
-                expansion.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-                expansion.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-                expansion.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10)
+                expansion.topAnchor.constraint(equalTo: row.bottomAnchor, constant: 10),
+                expansion.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+                expansion.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+                expansion.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12)
             ])
         } else {
-            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10).isActive = true
+            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12).isActive = true
         }
     }
 
@@ -1089,6 +1204,496 @@ private final class BucketRowView: NSView {
             detail.bottomAnchor.constraint(equalTo: row.bottomAnchor)
         ])
         return row
+    }
+}
+
+/// iStat-style top-N panel showing the busiest sessions. Ranks current session-mode buckets by
+/// cost descending — when slice 3 lands a tail-read live velocity, ranking swaps to tokens/min
+/// in the trailing 60s window without any caller change.
+@MainActor
+private final class TopSessionsView: NSView {
+    private let titleLabel = NSTextField(labelWithString: "Top sessions")
+    private let countLabel = NSTextField(labelWithString: "")
+    private let stack = NSStackView()
+    private let emptyLabel = NSTextField(labelWithString: "No active sessions in this view yet.")
+
+    private static let rowCap = 5
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.backgroundColor = Theme.surface.withAlphaComponent(0.55).cgColor
+        Theme.applyGhostRim(layer!, color: Theme.accentBlue, rimAlpha: 0.20, glowRadius: 8, glowAlpha: 0.18)
+        configure()
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
+
+    private func configure() {
+        titleLabel.font = Theme.titleFont(size: 12)
+        titleLabel.textColor = Theme.textSecondary
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        countLabel.font = Theme.bodyFont(size: 10)
+        countLabel.textColor = Theme.textTertiary
+        countLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSStackView(views: [titleLabel, NSView(), countLabel])
+        header.orientation = .horizontal
+        header.alignment = .firstBaseline
+        header.distribution = .fill
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.distribution = .fillEqually
+        stack.spacing = 2
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        emptyLabel.font = Theme.bodyFont(size: 11)
+        emptyLabel.textColor = Theme.textTertiary
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        emptyLabel.isHidden = true
+
+        addSubview(header)
+        addSubview(stack)
+        addSubview(emptyLabel)
+
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+
+            stack.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+
+            emptyLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    /// Cached buckets from the last 60s snapshot. Used to re-render the panel when a live tick
+    /// arrives without an intervening full snapshot.
+    private var lastBuckets: [AggregateBucket] = []
+
+    func update(buckets: [AggregateBucket]) {
+        lastBuckets = buckets
+        renderRanked(buckets: buckets, liveBySession: nil)
+    }
+
+    /// Live-tick override: re-rank by tokens-per-minute from the rolling 60s window. Falls back
+    /// to bucket totals when a session has no live activity yet.
+    func applyLive(velocities: [SessionVelocity]) {
+        var liveBySession: [String: SessionVelocity] = [:]
+        for velocity in velocities {
+            let split = ProjectPath.splitSessionBucketID("\(velocity.projectPath)/\(velocity.sessionId)")
+            let key = split.map { "\($0.project)/\($0.session)" }
+                ?? "\(velocity.projectPath)/\(velocity.sessionId)"
+            liveBySession[key] = velocity
+        }
+        renderRanked(buckets: lastBuckets, liveBySession: liveBySession)
+    }
+
+    private func renderRanked(
+        buckets: [AggregateBucket],
+        liveBySession: [String: SessionVelocity]?
+    ) {
+        for view in stack.arrangedSubviews {
+            stack.removeArrangedSubview(view); view.removeFromSuperview()
+        }
+
+        struct Item {
+            let bucket: AggregateBucket
+            let segments: [String]
+            let session: String
+            var velocity: SessionVelocity?
+        }
+        let items: [Item] = buckets.compactMap { bucket in
+            guard let split = ProjectPath.splitSessionBucketID(bucket.id) else { return nil }
+            let key = "\(split.project)/\(split.session)"
+            return Item(
+                bucket: bucket,
+                segments: ProjectPath.segments(split.project),
+                session: split.session,
+                velocity: liveBySession?[key]
+            )
+        }
+        guard !items.isEmpty else {
+            emptyLabel.isHidden = false
+            countLabel.stringValue = ""
+            return
+        }
+        emptyLabel.isHidden = true
+
+        let prefix = ProjectPath.commonPrefixLeavingTail(items.map(\.segments))
+        let ranked: [Item]
+        if liveBySession != nil {
+            // Sort by live tokens/min desc; sessions with zero live activity sink to the bottom
+            // but keep their original cost-desc ordering relative to each other.
+            ranked = items.sorted { lhs, rhs in
+                let l = lhs.velocity?.tokensPerMinute ?? 0
+                let r = rhs.velocity?.tokensPerMinute ?? 0
+                if l != r { return l > r }
+                return lhs.bucket.costUSD > rhs.bucket.costUSD
+            }
+        } else {
+            ranked = items.sorted { $0.bucket.costUSD > $1.bucket.costUSD }
+        }
+
+        let visible = Array(ranked.prefix(Self.rowCap))
+        let isLive = liveBySession != nil
+        countLabel.stringValue = isLive
+            ? "live · top \(visible.count)"
+            : (ranked.count > Self.rowCap
+                ? "top \(visible.count) of \(ranked.count)"
+                : "\(visible.count) shown")
+
+        for (index, item) in visible.enumerated() {
+            let tail = Array(item.segments.dropFirst(prefix.count))
+            let projectName = tail.last ?? tail.joined(separator: "/")
+            let row = TopSessionsRow(
+                rank: index + 1,
+                project: projectName,
+                session: shortSession(item.session),
+                tokens: item.bucket.totalTokens,
+                cost: item.bucket.costUSD,
+                liveTokensPerMinute: item.velocity?.tokensPerMinute,
+                liveCostPerHour: item.velocity?.costPerHour,
+                isActive: item.bucket.isActive || (item.velocity?.tokensPerMinute ?? 0) > 0
+            )
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+    }
+
+    private func shortSession(_ id: String) -> String {
+        guard id.count > 12 else { return id }
+        let head = id.prefix(8)
+        let tail = id.suffix(4)
+        return "\(head)…\(tail)"
+    }
+}
+
+@MainActor
+private final class TopSessionsRow: NSView {
+    init(
+        rank: Int,
+        project: String,
+        session: String,
+        tokens: Int,
+        cost: Double,
+        liveTokensPerMinute: Double?,
+        liveCostPerHour: Double?,
+        isActive: Bool
+    ) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let primary: NSColor = isActive ? Theme.accentMint : Theme.textPrimary
+        let rankLabel = NSTextField(labelWithString: "\(rank)")
+        rankLabel.font = Theme.numericFont(size: 10)
+        rankLabel.textColor = Theme.textTertiary
+        rankLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let projectField = NSTextField(labelWithString: isActive ? "● \(project)" : project)
+        projectField.font = Theme.titleFont(size: 11)
+        projectField.textColor = primary
+        projectField.lineBreakMode = .byTruncatingMiddle
+        projectField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        projectField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        projectField.translatesAutoresizingMaskIntoConstraints = false
+
+        let sessionField = NSTextField(labelWithString: session)
+        sessionField.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
+        sessionField.textColor = Theme.textTertiary
+        sessionField.translatesAutoresizingMaskIntoConstraints = false
+
+        // When a live tokens/min figure is available, prefer it over the static bucket total —
+        // that's the whole point of the live tick: surface what's happening right now, not the
+        // session's lifetime aggregate.
+        let tokensText: String = if let tpm = liveTokensPerMinute, tpm > 0 {
+            "\(BurnFormatting.compactTokens(Int(tpm)))/m"
+        } else {
+            "\(BurnFormatting.compactTokens(tokens)) TK"
+        }
+        let tokensField = NSTextField(labelWithString: tokensText)
+        tokensField.font = Theme.numericFont(size: 11)
+        tokensField.textColor = Theme.textSecondary
+        tokensField.translatesAutoresizingMaskIntoConstraints = false
+
+        let costText: String = if let cph = liveCostPerHour, cph > 0 {
+            String(format: "$%.2f/hr", cph)
+        } else {
+            String(format: "$%.2f", cost)
+        }
+        let costField = NSTextField(labelWithString: costText)
+        costField.font = Theme.numericFont(size: 11)
+        costField.textColor = Theme.accentMint
+        costField.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(rankLabel)
+        addSubview(projectField)
+        addSubview(sessionField)
+        addSubview(tokensField)
+        addSubview(costField)
+
+        NSLayoutConstraint.activate([
+            rankLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+            rankLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            rankLabel.widthAnchor.constraint(equalToConstant: 14),
+
+            projectField.leadingAnchor.constraint(equalTo: rankLabel.trailingAnchor, constant: 6),
+            projectField.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            sessionField.leadingAnchor.constraint(equalTo: projectField.trailingAnchor, constant: 8),
+            sessionField.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            costField.trailingAnchor.constraint(equalTo: trailingAnchor),
+            costField.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            tokensField.trailingAnchor.constraint(equalTo: costField.leadingAnchor, constant: -10),
+            tokensField.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            sessionField.trailingAnchor.constraint(lessThanOrEqualTo: tokensField.leadingAnchor, constant: -8),
+
+            heightAnchor.constraint(equalToConstant: 20)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
+}
+
+/// Single horizontal hairline separating the live priority panel from the drill-down rows.
+@MainActor
+private final class SectionDivider: NSView {
+    private let line = NSView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        line.wantsLayer = true
+        line.layer?.backgroundColor = Theme.divider.cgColor
+        line.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(line)
+        NSLayoutConstraint.activate([
+            line.leadingAnchor.constraint(equalTo: leadingAnchor),
+            line.trailingAnchor.constraint(equalTo: trailingAnchor),
+            line.centerYAnchor.constraint(equalTo: centerYAnchor),
+            line.heightAnchor.constraint(equalToConstant: 1)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
+}
+
+@MainActor
+private final class ProjectGroupRowView: NSView {
+    var onToggle: ((String) -> Void)?
+
+    private let key: String
+    private let title: String
+    private let sessionCount: Int
+    private let totalTokens: Int
+    private let totalCost: Double
+    private let anyActive: Bool
+    private let expanded: Bool
+
+    init(
+        key: String,
+        title: String,
+        sessionCount: Int,
+        totalTokens: Int,
+        totalCost: Double,
+        anyActive: Bool,
+        expanded: Bool
+    ) {
+        self.key = key
+        self.title = title
+        self.sessionCount = sessionCount
+        self.totalTokens = totalTokens
+        self.totalCost = totalCost
+        self.anyActive = anyActive
+        self.expanded = expanded
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.backgroundColor = (anyActive ? Theme.surfaceMuted : Theme.surface)
+            .withAlphaComponent(0.55).cgColor
+        let rim: NSColor = anyActive ? Theme.accentMint : Theme.accentBlue
+        Theme.applyGhostRim(
+            layer!,
+            color: rim,
+            rimAlpha: anyActive ? 0.32 : 0.14,
+            glowRadius: anyActive ? 10 : 6,
+            glowAlpha: anyActive ? 0.28 : 0.10
+        )
+        configure()
+        addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(handleClick)))
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
+
+    @objc private func handleClick() { onToggle?(key) }
+
+    private func configure() {
+        let primary: NSColor = anyActive ? Theme.accentMint : Theme.textPrimary
+        let titleString = anyActive ? "● \(title)" : title
+        let titleField = NSTextField(labelWithString: titleString)
+        titleField.font = Theme.titleFont(size: 13)
+        titleField.textColor = primary
+        titleField.lineBreakMode = .byTruncatingMiddle
+        titleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        titleField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        if anyActive {
+            titleField.attributedStringValue = Theme.glowAttributedTitle(
+                titleString,
+                color: primary,
+                font: Theme.titleFont(size: 13)
+            )
+        }
+        titleField.translatesAutoresizingMaskIntoConstraints = false
+
+        let countField = NSTextField(labelWithString: "\(sessionCount) sess")
+        countField.font = Theme.bodyFont(size: 10)
+        countField.textColor = Theme.textTertiary
+        countField.translatesAutoresizingMaskIntoConstraints = false
+
+        let tokens = NSTextField(labelWithString: "\(BurnFormatting.compactTokens(totalTokens)) TK")
+        tokens.font = Theme.numericFont(size: 12)
+        tokens.textColor = Theme.textSecondary
+        tokens.translatesAutoresizingMaskIntoConstraints = false
+
+        let cost = NSTextField(labelWithString: String(format: "$%.2f", totalCost))
+        cost.font = Theme.numericFont(size: 12)
+        cost.textColor = Theme.accentMint
+        cost.translatesAutoresizingMaskIntoConstraints = false
+
+        let chevron = NSImageView()
+        chevron.image = NSImage(
+            systemSymbolName: expanded ? "chevron.down" : "chevron.right",
+            accessibilityDescription: nil
+        )
+        chevron.contentTintColor = Theme.textTertiary
+        chevron.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        chevron.translatesAutoresizingMaskIntoConstraints = false
+
+        let summary = NSStackView(views: [countField, tokens, cost, chevron])
+        summary.orientation = .horizontal
+        summary.spacing = 12
+        summary.alignment = .centerY
+        summary.translatesAutoresizingMaskIntoConstraints = false
+
+        let row = NSStackView(views: [titleField, NSView(), summary])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.distribution = .fill
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10)
+        ])
+    }
+}
+
+/// Small mint orb that emits one scale+opacity pulse per refresh tick. Sized to slot inline with
+/// the hero rate label without competing for visual weight — it's a confirmation signal, not a
+/// status badge.
+@MainActor
+final class PulseOrb: NSView {
+    private let orb = NSView()
+    private let halo = NSView()
+    private static let baseDiameter: CGFloat = 10
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 22).isActive = true
+        heightAnchor.constraint(equalToConstant: 22).isActive = true
+
+        halo.wantsLayer = true
+        halo.translatesAutoresizingMaskIntoConstraints = false
+        halo.layer?.backgroundColor = Theme.accentMint.withAlphaComponent(0.0).cgColor
+        halo.layer?.cornerRadius = Self.baseDiameter
+        halo.layer?.shadowColor = Theme.accentMint.cgColor
+        halo.layer?.shadowRadius = 6
+        halo.layer?.shadowOpacity = 0
+        halo.layer?.shadowOffset = .zero
+
+        orb.wantsLayer = true
+        orb.translatesAutoresizingMaskIntoConstraints = false
+        orb.layer?.backgroundColor = Theme.accentMint.cgColor
+        orb.layer?.cornerRadius = Self.baseDiameter / 2
+
+        addSubview(halo)
+        addSubview(orb)
+
+        NSLayoutConstraint.activate([
+            orb.widthAnchor.constraint(equalToConstant: Self.baseDiameter),
+            orb.heightAnchor.constraint(equalToConstant: Self.baseDiameter),
+            orb.centerXAnchor.constraint(equalTo: centerXAnchor),
+            orb.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            halo.widthAnchor.constraint(equalToConstant: Self.baseDiameter * 2),
+            halo.heightAnchor.constraint(equalToConstant: Self.baseDiameter * 2),
+            halo.centerXAnchor.constraint(equalTo: centerXAnchor),
+            halo.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
+
+    func pulse() {
+        guard let orbLayer = orb.layer, let haloLayer = halo.layer else { return }
+        // Orb: subtle scale-up to amplify presence.
+        let orbScale = CABasicAnimation(keyPath: "transform.scale")
+        orbScale.fromValue = 1.0
+        orbScale.toValue = 1.35
+        orbScale.duration = 0.18
+        orbScale.autoreverses = true
+        orbScale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        orbLayer.add(orbScale, forKey: "pulseScale")
+
+        // Halo: expanding ring with fading opacity. Re-create the animation each time so back-to-
+        // back pulses don't stack on the same animation key.
+        let haloScale = CABasicAnimation(keyPath: "transform.scale")
+        haloScale.fromValue = 0.6
+        haloScale.toValue = 1.4
+        haloScale.duration = 0.6
+
+        let haloOpacity = CABasicAnimation(keyPath: "opacity")
+        haloOpacity.fromValue = 0.6
+        haloOpacity.toValue = 0.0
+        haloOpacity.duration = 0.6
+
+        let group = CAAnimationGroup()
+        group.animations = [haloScale, haloOpacity]
+        group.duration = 0.6
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        haloLayer.shadowOpacity = 0
+        haloLayer.add(group, forKey: "pulseHalo")
     }
 }
 

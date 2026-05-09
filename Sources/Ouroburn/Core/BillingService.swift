@@ -59,6 +59,11 @@ actor BillingService {
     private var baselinePollInterval: TimeInterval = 5 * 60 // overridden via setPollInterval
     private var consecutiveFailures: Int = 0 // doubles the cool-down each time, capped at the ceiling
     private var lastStatusMessage: String? // human-readable billing status surfaced into the snapshot
+    /// While the popover is open we shorten the floor so the user's monthly tile keeps up. Still
+    /// rides on top of `consecutiveFailures` backoff and the upstream 429 cool-down — this only
+    /// changes the *baseline*, not the cooldown semantics.
+    private var foregroundFloorSeconds: TimeInterval?
+    static let foregroundBoostSeconds: TimeInterval = 60
 
     init(
         cacheURL: URL,
@@ -95,6 +100,13 @@ actor BillingService {
     func setPollInterval(minutes: Double) {
         let clamped = min(max(minutes, 1), 60)
         baselinePollInterval = clamped * 60
+    }
+
+    /// Toggle the foreground boost on/off. While `active`, the effective baseline floors at
+    /// `foregroundBoostSeconds` (60s) — the user's configured interval still wins if it's already
+    /// shorter. Backoff and 429 cool-downs are unchanged.
+    func setForegroundActive(_ active: Bool) {
+        foregroundFloorSeconds = active ? Self.foregroundBoostSeconds : nil
     }
 
     func currentMonthBilledUSD() async -> Double? {
@@ -138,9 +150,16 @@ actor BillingService {
 
     /// Effective interval = baseline × 2^failures, capped at the ceiling. After a successful
     /// fetch the failure count resets and we drop back to the user's configured cadence.
+    /// While the foreground boost is active, the baseline is replaced by the smaller of the two
+    /// (so a user who already runs 30s polls isn't slowed down by the boost).
     private func currentPollInterval() -> TimeInterval {
+        let baseline: TimeInterval = if let floor = foregroundFloorSeconds {
+            min(baselinePollInterval, floor)
+        } else {
+            baselinePollInterval
+        }
         let multiplier = pow(2.0, Double(consecutiveFailures))
-        return min(baselinePollInterval * multiplier, Self.backoffCeilingSeconds)
+        return min(baseline * multiplier, Self.backoffCeilingSeconds)
     }
 
     private func registerSuccess() {

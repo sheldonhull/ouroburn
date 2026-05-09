@@ -100,6 +100,73 @@ struct JSONLLoader {
         return attrs?[.modificationDate] as? Date ?? .distantPast
     }
 
+    /// Tail-read: returns only entries appended since `fromOffset`, plus the offset just past the
+    /// last complete line consumed. Caller persists `newOffset` per-URL to keep deltas cheap on
+    /// the next tick. Partial last lines are deliberately not consumed — they're picked up on the
+    /// following tick once the writer has flushed the newline.
+    func loadIncremental(
+        from url: URL,
+        fromOffset: UInt64
+    ) -> (entries: [UsageEntry], newOffset: UInt64) {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return ([], fromOffset)
+        }
+        defer { try? handle.close() }
+
+        let fileSize: UInt64
+        do {
+            fileSize = try handle.seekToEnd()
+        } catch {
+            return ([], fromOffset)
+        }
+        if fileSize <= fromOffset { return ([], fromOffset) }
+
+        do {
+            try handle.seek(toOffset: fromOffset)
+        } catch {
+            return ([], fromOffset)
+        }
+        guard let data = try? handle.readToEnd(), !data.isEmpty else {
+            return ([], fileSize)
+        }
+
+        // Find offset of last newline so we don't consume a partial trailing line.
+        let newlineByte = UInt8(ascii: "\n")
+        var lastNewlineIdx: Int? = nil
+        for idx in stride(from: data.count - 1, through: 0, by: -1) where data[idx] == newlineByte {
+            lastNewlineIdx = idx
+            break
+        }
+        let consumeUpTo: Int
+        let advanced: UInt64
+        if let lastIdx = lastNewlineIdx {
+            consumeUpTo = lastIdx + 1
+            advanced = fromOffset + UInt64(consumeUpTo)
+        } else {
+            // No newline yet — wait for the writer to flush. Don't advance offset.
+            return ([], fromOffset)
+        }
+
+        let consumable = data.prefix(consumeUpTo)
+        guard let text = String(data: consumable, encoding: .utf8) else {
+            return ([], advanced)
+        }
+        let (project, session) = Self.deriveProjectAndSession(from: url)
+        var out: [UsageEntry] = []
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            if let entry = parseLine(raw, project: project, session: session) {
+                out.append(entry)
+            }
+        }
+        return (out, advanced)
+    }
+
+    /// Returns the current file size (used to seed tail-read offsets without consuming history).
+    func currentSize(of url: URL) -> UInt64 {
+        let attrs = try? fileManager.attributesOfItem(atPath: url.path)
+        return (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
     /// Reads a file fresh and returns its parsed entries (no dedup tracking — caller dedupes
     /// across the merged stream). Used by the tracker's mtime cache.
     func loadAllEntries(from url: URL) -> [UsageEntry] {
