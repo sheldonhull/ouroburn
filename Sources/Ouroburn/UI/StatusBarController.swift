@@ -16,8 +16,8 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
 
     init(tracker: BurnTracker) {
         self.tracker = tracker
-        item = NSStatusBar.system.statusItem(withLength: 28)
-        iconView = OuroborosView(frame: NSRect(x: 0, y: 0, width: 22, height: 22))
+        item = NSStatusBar.system.statusItem(withLength: 32)
+        iconView = OuroborosView(frame: NSRect(x: 0, y: 0, width: 26, height: 22))
         iconView.translatesAutoresizingMaskIntoConstraints = false
         super.init()
 
@@ -29,7 +29,7 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
             NSLayoutConstraint.activate([
                 iconView.centerXAnchor.constraint(equalTo: button.centerXAnchor),
                 iconView.centerYAnchor.constraint(equalTo: button.centerYAnchor),
-                iconView.widthAnchor.constraint(equalToConstant: 22),
+                iconView.widthAnchor.constraint(equalToConstant: 26),
                 iconView.heightAnchor.constraint(equalToConstant: 22)
             ])
         }

@@ -3,44 +3,61 @@ import QuartzCore
 
 /// Animated ouroboros for the menu bar.
 ///
-/// Renders a coiled snake biting its tail using a tapered body of varying thickness (head fat,
-/// tail thin), an open mouth wedge, an eye, and a tail tip clamped in the mouth. Idle color is
-/// a bright neon cyan with a subtle glow so the icon stays legible against any menu bar wallpaper;
-/// it heats toward amber and then rose as the burn rate climbs.
+/// Renders a coiled snake biting its tail using a tapered body (head fat, tail thin), an open
+/// mouth wedge, an eye, and a tail tip clamped in the mouth. A bold tier number (1-10) sits in
+/// the center to communicate burn intensity at a glance.
+///
+/// Architecture: snake is rasterized to a `CGImage` once per tier (color + size unchanged
+/// between ticks), then a single `CABasicAnimation` on `transform.rotation.z` spins the image
+/// layer — the GPU composites the rotation, so per-frame CPU is zero. Tier number sits in a
+/// sibling layer that does NOT inherit the rotation transform.
 @MainActor
 final class OuroborosView: NSView {
-    private var displayLink: CVDisplayLink?
-    private var phase: CGFloat = 0
-    private var rotationsPerSecond: CGFloat = 0.10
-    private var bodyColor: NSColor = OuroborosView.idleColor
-    private var glowColor: NSColor = OuroborosView.idleColor.withAlphaComponent(0.55)
-    private var lastTickTime: CFTimeInterval = CACurrentMediaTime()
-    private var lastDrawTime: CFTimeInterval = 0
-    private var lastDrawnPhase: CGFloat = 0
-    /// Idle redraw cap. The snake's slow base rotation (~0.1 RPS) advances ~3° per frame at
-    /// 12 fps — still reads as "spinning" but slashes per-frame `drawSnake` cost. We bump up
-    /// when the burn rate climbs (see `tick`) so a real spike is still visually responsive.
-    private let idleFrameInterval: CFTimeInterval = 1.0 / 12.0
-    private let activeFrameInterval: CFTimeInterval = 1.0 / 30.0
-    /// Minimum angular change required to repaint. At idle RPS this dominates the throttle and
-    /// keeps the GPU mostly idle even though the displayLink keeps ticking.
-    private let minPhaseDeltaDegrees: CGFloat = 2.5
+    private let snakeLayer = CALayer()
+    private let numberLayer = CATextLayer()
+    private var currentTier: Int = -1
+    private var currentImageSize: CGSize = .zero
 
+    /// Number of tiers mapped onto `liveRate / medianRate`. Tier 1 = baseline (idle slow spin),
+    /// tier 10 = max RPS (max color). Each tier picks a distinct rotation speed AND a distinct
+    /// interpolated color along the idle → warm → hot ramp.
+    static let tierCount = 10
     static let idleColor = Theme.accentBlue
     static let warmColor = Theme.accentMint
     static let hotColor = Theme.accentRed
     static let baseRPS: CGFloat = 0.10
     static let maxRPS: CGFloat = 1.50
-    static let spikeMultiplier: CGFloat = 1.30 // live > median * spikeMultiplier kicks the ramp
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.shadowColor = bodyColor.cgColor
+        layer = CALayer()
+        layer?.frame = bounds
         layer?.shadowRadius = 4
         layer?.shadowOpacity = 0.45
         layer?.shadowOffset = .zero
-        startAnimating()
+
+        snakeLayer.frame = bounds
+        snakeLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        snakeLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        snakeLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        layer?.addSublayer(snakeLayer)
+
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        numberLayer.contentsScale = scale
+        numberLayer.alignmentMode = .center
+        numberLayer.font = NSFont.boldSystemFont(ofSize: 10) as CTFont
+        numberLayer.fontSize = 10
+        numberLayer.foregroundColor = NSColor.white.cgColor
+        // Subtle dark shadow so the number stays legible against any tier color.
+        numberLayer.shadowColor = NSColor.black.cgColor
+        numberLayer.shadowOpacity = 0.85
+        numberLayer.shadowRadius = 1.5
+        numberLayer.shadowOffset = .zero
+        layoutNumberLayer()
+        layer?.addSublayer(numberLayer)
+
+        applyTier(1)
     }
 
     @available(*, unavailable)
@@ -48,91 +65,115 @@ final class OuroborosView: NSView {
         fatalError("not used")
     }
 
-    /// Drive the rotation + color from the live vs. median rate.
-    ///
-    /// Below the spike multiplier (live ≤ median × 1.30) the snake holds a slow base spin so
-    /// it always reads as "running". Above that, rotation and color ramp up linearly until
-    /// the live rate is twice the spike threshold, where it pegs at hot red.
+    override func layout() {
+        super.layout()
+        layer?.frame = bounds
+        snakeLayer.frame = bounds
+        snakeLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        layoutNumberLayer()
+        if bounds.size != currentImageSize {
+            // Force a re-rasterize at the new size.
+            currentTier = -1
+            applyTier(max(1, currentTier))
+        }
+    }
+
+    private func layoutNumberLayer() {
+        let font = NSFont.boldSystemFont(ofSize: 10)
+        let lineHeight = font.ascender - font.descender
+        numberLayer.frame = CGRect(
+            x: 0,
+            y: (bounds.height - lineHeight) / 2,
+            width: bounds.width,
+            height: lineHeight
+        )
+    }
+
+    /// Map `liveRate / medianRate` onto tiers 1...10. `liveRate <= medianRate` → tier 1.
+    /// `liveRate >= medianRate * 3` → tier 10. Linear in between.
     func update(liveRate: Double, medianRate: Double) {
         let safeMedian = max(medianRate, 1)
         let ratio = max(0, liveRate / safeMedian)
-        if ratio <= Double(Self.spikeMultiplier) {
-            rotationsPerSecond = Self.baseRPS
-            bodyColor = Self.idleColor
-        } else {
-            let t = min(1, (ratio - Double(Self.spikeMultiplier)) / Double(Self.spikeMultiplier))
-            rotationsPerSecond = Self.baseRPS + (Self.maxRPS - Self.baseRPS) * CGFloat(t)
-            bodyColor = t < 0.5
-                ? Self.lerp(Self.idleColor, Self.warmColor, CGFloat(t * 2))
-                : Self.lerp(Self.warmColor, Self.hotColor, CGFloat((t - 0.5) * 2))
+        let normalized = min(1.0, max(0.0, (ratio - 1.0) / 2.0))
+        let tier = max(1, min(Self.tierCount, 1 + Int(normalized * Double(Self.tierCount - 1) + 0.5)))
+        applyTier(tier)
+    }
+
+    private func applyTier(_ tier: Int) {
+        guard tier != currentTier || bounds.size != currentImageSize else { return }
+        currentTier = tier
+        currentImageSize = bounds.size
+
+        let t = CGFloat(tier - 1) / CGFloat(max(1, Self.tierCount - 1))
+        let rps = Self.baseRPS + (Self.maxRPS - Self.baseRPS) * t
+        let color = Self.colorFor(tier: tier)
+
+        // Render once at the current size + color. Result is cached in the layer's `contents`
+        // until the tier or size changes again.
+        let image = renderSnakeImage(color: color, size: bounds.size)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        snakeLayer.contents = image
+        layer?.shadowColor = color.cgColor
+        layer?.shadowRadius = 3 + 5 * t
+        numberLayer.string = "\(tier)"
+        numberLayer.foregroundColor = contrastTextColor(forBackground: color).cgColor
+        CATransaction.commit()
+
+        installRotation(rps: rps)
+    }
+
+    private func installRotation(rps: CGFloat) {
+        snakeLayer.removeAnimation(forKey: "spin")
+        let rot = CABasicAnimation(keyPath: "transform.rotation.z")
+        rot.fromValue = 0
+        rot.toValue = -2 * Double.pi
+        rot.duration = 1.0 / Double(rps)
+        rot.repeatCount = .infinity
+        rot.isRemovedOnCompletion = false
+        snakeLayer.add(rot, forKey: "spin")
+    }
+
+    private static func colorFor(tier: Int) -> NSColor {
+        let t = CGFloat(tier - 1) / CGFloat(max(1, tierCount - 1))
+        if t < 0.5 {
+            return lerp(idleColor, warmColor, t * 2)
         }
-        glowColor = bodyColor.withAlphaComponent(0.55)
-        layer?.shadowColor = bodyColor.cgColor
-        layer?.shadowRadius = 3 + 5 * CGFloat(min(
-            1,
-            max(0, (ratio - Double(Self.spikeMultiplier)) / Double(Self.spikeMultiplier))
-        ))
-        needsDisplay = true
+        return lerp(warmColor, hotColor, (t - 0.5) * 2)
     }
 
-    func stopAnimating() {
-        if let displayLink {
-            CVDisplayLinkStop(displayLink)
-            self.displayLink = nil
+    private func contrastTextColor(forBackground color: NSColor) -> NSColor {
+        // Compute relative luminance (sRGB) and pick black on light backgrounds, white on dark.
+        let rgb = color.usingColorSpace(.sRGB) ?? color
+        let r = rgb.redComponent
+        let g = rgb.greenComponent
+        let b = rgb.blueComponent
+        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return lum > 0.6 ? .black : .white
+    }
+
+    private func renderSnakeImage(color: NSColor, size: CGSize) -> CGImage? {
+        guard size.width > 0, size.height > 0 else { return nil }
+        let nsImage = NSImage(size: size, flipped: false) { [color] _ in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            let rect = CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1)
+            let center = CGPoint(x: rect.midX, y: rect.midY)
+            let radius = min(rect.width, rect.height) / 2 - 1
+            Self.drawSnake(in: ctx, center: center, radius: radius, color: color)
+            return true
         }
+        var rect = CGRect(origin: .zero, size: size)
+        return nsImage.cgImage(forProposedRect: &rect, context: nil, hints: nil)
     }
 
-    private func startAnimating() {
-        var link: CVDisplayLink?
-        CVDisplayLinkCreateWithActiveCGDisplays(&link)
-        guard let link else { return }
-        displayLink = link
-        let callback: CVDisplayLinkOutputCallback = { _, _, _, _, _, context in
-            guard let context else { return kCVReturnSuccess }
-            let view = Unmanaged<OuroborosView>.fromOpaque(context).takeUnretainedValue()
-            DispatchQueue.main.async { view.tick() }
-            return kCVReturnSuccess
-        }
-        CVDisplayLinkSetOutputCallback(link, callback, Unmanaged.passUnretained(self).toOpaque())
-        CVDisplayLinkStart(link)
-    }
+    // MARK: - Drawing (pure, called once per tier transition)
 
-    private func tick() {
-        let now = CACurrentMediaTime()
-        let dt = max(0, now - lastTickTime)
-        lastTickTime = now
-        phase += rotationsPerSecond * CGFloat(dt) * (2 * .pi)
-        if phase > 2 * .pi { phase -= 2 * .pi }
-        // Adaptive frame budget: hot RPS warrants the higher cap so a spike animates smoothly;
-        // at idle we coast at 12 fps so a 5+ CPU% draw cost doesn't follow us into Activity
-        // Monitor. The phase-delta guard short-circuits identical frames entirely.
-        let interval = rotationsPerSecond > Self.baseRPS ? activeFrameInterval : idleFrameInterval
-        guard now - lastDrawTime >= interval else { return }
-        let deltaDegrees = abs(phase - lastDrawnPhase) * 180 / .pi
-        guard deltaDegrees >= minPhaseDeltaDegrees else { return }
-        lastDrawTime = now
-        lastDrawnPhase = phase
-        needsDisplay = true
-    }
-
-    override func draw(_: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let rect = bounds.insetBy(dx: 1, dy: 1)
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        let radius = min(rect.width, rect.height) / 2 - 1
-
-        ctx.saveGState()
-        ctx.translateBy(x: center.x, y: center.y)
-        ctx.rotate(by: phase)
-        ctx.translateBy(x: -center.x, y: -center.y)
-        drawSnake(in: ctx, center: center, radius: radius)
-        ctx.restoreGState()
-    }
-
-    private func drawSnake(in ctx: CGContext, center: CGPoint, radius: CGFloat) {
-        let mainColor = bodyColor
-        let highlightColor = bodyColor.blended(withFraction: 0.45, of: .white) ?? bodyColor
-        let darkColor = bodyColor.blended(withFraction: 0.45, of: .black) ?? bodyColor
+    private static func drawSnake(in ctx: CGContext, center: CGPoint, radius: CGFloat, color: NSColor) {
+        let mainColor = color
+        let highlightColor = color.blended(withFraction: 0.45, of: .white) ?? color
+        let darkColor = color.blended(withFraction: 0.45, of: .black) ?? color
+        let glowColor = color.withAlphaComponent(0.55)
 
         let mouthGap: CGFloat = 0.34
         let bodyStart: CGFloat = mouthGap
@@ -143,7 +184,7 @@ final class OuroborosView: NSView {
         let innerHead: CGFloat = radius * 0.42
         let innerTail: CGFloat = radius * 0.78
 
-        // Outer glow halo — soft larger pass, drawn first.
+        // Outer glow halo
         ctx.saveGState()
         ctx.setShadow(offset: .zero, blur: 6, color: glowColor.cgColor)
         let haloPath = CGMutablePath()
@@ -160,7 +201,7 @@ final class OuroborosView: NSView {
         ctx.strokePath()
         ctx.restoreGState()
 
-        // Body path
+        // Body
         let bodyPath = CGMutablePath()
         let steps = 56
         for i in 0 ... steps {
@@ -179,12 +220,11 @@ final class OuroborosView: NSView {
         }
         bodyPath.closeSubpath()
 
-        // Body fill with vertical sheen via two-pass (fill, then alpha-blended highlight)
         ctx.addPath(bodyPath)
         ctx.setFillColor(mainColor.cgColor)
         ctx.fillPath()
 
-        // Inner highlight rim along the outside edge for a glassy neon feel.
+        // Inner highlight rim
         ctx.saveGState()
         ctx.addPath(bodyPath)
         ctx.clip()
@@ -202,7 +242,7 @@ final class OuroborosView: NSView {
         ctx.strokePath()
         ctx.restoreGState()
 
-        // Scale ridges along the spine
+        // Scale ridges
         ctx.setLineWidth(0.4)
         ctx.setStrokeColor(darkColor.withAlphaComponent(0.55).cgColor)
         let scaleCount = 16
@@ -245,7 +285,7 @@ final class OuroborosView: NSView {
         ))
         ctx.strokePath()
 
-        // Tail tip + mouth
+        // Tail + mouth
         let tailAngle = bodyStart
         let tailRadial = (outerTail + innerTail) / 2
         let tailCenter = CGPoint(x: center.x + tailRadial * cos(tailAngle), y: center.y + tailRadial * sin(tailAngle))
@@ -272,7 +312,7 @@ final class OuroborosView: NSView {
         ctx.setFillColor(NSColor(calibratedWhite: 0.05, alpha: 0.9).cgColor)
         ctx.fillPath()
 
-        // Eye on the head
+        // Eye
         let eyeCenter = CGPoint(
             x: headCenter.x - toTailNorm.x * headSize * 0.08 + perp.x * headSize * 0.45,
             y: headCenter.y - toTailNorm.y * headSize * 0.08 + perp.y * headSize * 0.45
@@ -296,7 +336,7 @@ final class OuroborosView: NSView {
         ))
         ctx.fillPath()
 
-        // Tail wedge held in the mouth
+        // Tail wedge
         let tailTip = CGPoint(
             x: tailCenter.x - cos(tailAngle) * (outerTail - innerTail) * 0.45,
             y: tailCenter.y - sin(tailAngle) * (outerTail - innerTail) * 0.45
@@ -319,7 +359,7 @@ final class OuroborosView: NSView {
         ctx.fillPath()
     }
 
-    private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
+    private static func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
         a + (b - a) * t
     }
 
