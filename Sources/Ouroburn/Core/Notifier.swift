@@ -29,10 +29,10 @@ final class Notifier {
 
         let content = UNMutableNotificationContent()
         content.title = "ouroburn — burn rate spike"
-        content.body = String(
-            format: "Now %.0f tok/min (was %.0f). ~$%.2f/hr at this pace.",
-            currentRate, previousRate, costPerHour
-        )
+        let now = NumberFormatting.compactRate(tokensPerMinute: currentRate)
+        let was = NumberFormatting.compactRate(tokensPerMinute: previousRate)
+        let cph = NumberFormatting.compactRate(dollarsPerHour: costPerHour)
+        content.body = "Now \(now) (was \(was)). \(cph) at this pace."
         content.sound = .default
 
         let request = UNNotificationRequest(

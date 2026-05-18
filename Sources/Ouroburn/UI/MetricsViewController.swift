@@ -126,7 +126,7 @@ final class MetricsViewController: NSViewController {
             symbolName = "checkmark.circle.fill"
             color = Theme.accentMint
             enabled = true
-            tooltip = spendUSD.map { String(format: "Connected · $%.2f MTD — click to sign out", $0) }
+            tooltip = spendUSD.map { "Connected · \(NumberFormatting.compactDollars($0)) MTD — click to sign out" }
                 ?? "Connected · fetching MTD"
         case let .failingTransient(reason):
             symbolName = "exclamationmark.circle.fill"
@@ -223,7 +223,7 @@ final class MetricsViewController: NSViewController {
         // projected number from the latest snapshot.
         if live.tokensPerMinute > 0 {
             headlineCost.attributedStringValue = Theme.glowAttributedTitle(
-                String(format: "~$%.2f / hr · live", live.costPerHour),
+                "\(NumberFormatting.compactRate(dollarsPerHour: live.costPerHour)) · live",
                 color: Theme.accentMint,
                 font: Theme.titleFont(size: 18)
             )
@@ -259,19 +259,19 @@ final class MetricsViewController: NSViewController {
         let live = snapshot.tokensPerMinute
 
         headlineRate.attributedStringValue = Theme.glowAttributedTitle(
-            "\(BurnFormatting.compactTokens(Int(median))) TK/min",
+            "\(NumberFormatting.compactTokens(Int(median))) tk/m",
             color: rateColor(rate: median),
             font: Theme.titleFont(size: 28)
         )
         headlineSubrate.stringValue = String(
-            format: "median (rolling 30m) · live %@ TK/min%@",
-            BurnFormatting.compactTokens(Int(live)), stale
+            format: "median (rolling 30m) · live %@ tk/m%@",
+            NumberFormatting.compactTokens(Int(live)), stale
         )
         headlineSubrate.font = Theme.bodyFont(size: 11)
         headlineSubrate.textColor = Theme.textTertiary
 
         headlineCost.attributedStringValue = Theme.glowAttributedTitle(
-            String(format: "~$%.2f / hr", snapshot.costPerHour),
+            NumberFormatting.compactRate(dollarsPerHour: snapshot.costPerHour),
             color: Theme.accentMint,
             font: Theme.titleFont(size: 18)
         )
@@ -970,11 +970,11 @@ final class StatTile: NSView {
             tokens.textColor = Theme.textTertiary
         } else {
             cost.attributedStringValue = Theme.glowAttributedTitle(
-                String(format: "$%.2f", costUSD),
+                NumberFormatting.compactDollars(costUSD),
                 color: accent,
                 font: Theme.titleFont(size: 18)
             )
-            tokens.stringValue = "\(BurnFormatting.compactTokens(tokenCount)) TK"
+            tokens.stringValue = "\(NumberFormatting.compactTokens(tokenCount)) tk"
             tokens.font = Theme.numericFont(size: 11)
             tokens.textColor = Theme.textSecondary
         }
@@ -1143,12 +1143,12 @@ private final class BucketRowView: NSView {
         }
         title.translatesAutoresizingMaskIntoConstraints = false
 
-        let tokens = NSTextField(labelWithString: "\(BurnFormatting.compactTokens(bucket.totalTokens)) TK")
+        let tokens = NSTextField(labelWithString: "\(NumberFormatting.compactTokens(bucket.totalTokens)) tk")
         tokens.font = Theme.numericFont(size: 13)
         tokens.textColor = Theme.textSecondary
         tokens.translatesAutoresizingMaskIntoConstraints = false
 
-        let cost = NSTextField(labelWithString: String(format: "$%.2f", bucket.costUSD))
+        let cost = NSTextField(labelWithString: NumberFormatting.compactDollars(bucket.costUSD))
         cost.font = Theme.numericFont(size: 13)
         cost.textColor = Theme.accentMint
         cost.translatesAutoresizingMaskIntoConstraints = false
@@ -1253,10 +1253,10 @@ private final class BucketRowView: NSView {
 
         let detail = NSTextField(labelWithString: String(
             format: "in %@ · out %@ · cache %@/%@",
-            BurnFormatting.compactTokens(model.inputTokens),
-            BurnFormatting.compactTokens(model.outputTokens),
-            BurnFormatting.compactTokens(model.cacheCreationTokens),
-            BurnFormatting.compactTokens(model.cacheReadTokens)
+            NumberFormatting.compactTokens(model.inputTokens),
+            NumberFormatting.compactTokens(model.outputTokens),
+            NumberFormatting.compactTokens(model.cacheCreationTokens),
+            NumberFormatting.compactTokens(model.cacheReadTokens)
         ))
         detail.font = Theme.bodyFont(size: 10)
         detail.textColor = Theme.textTertiary
@@ -1265,7 +1265,7 @@ private final class BucketRowView: NSView {
 
         let amount =
             NSTextField(
-                labelWithString: "\(BurnFormatting.compactTokens(model.totalTokens)) TK · $\(String(format: "%.2f", model.costUSD))"
+                labelWithString: "\(NumberFormatting.compactTokens(model.totalTokens)) tk · \(NumberFormatting.compactDollars(model.costUSD))"
             )
         amount.font = Theme.numericFont(size: 11)
         amount.textColor = Theme.textSecondary
@@ -1529,9 +1529,9 @@ private final class TopSessionsRow: NSView {
         // that's the whole point of the live tick: surface what's happening right now, not the
         // session's lifetime aggregate.
         let tokensText = if let tpm = liveTokensPerMinute, tpm > 0 {
-            "\(BurnFormatting.compactTokens(Int(tpm)))/m"
+            NumberFormatting.compactRate(tokensPerMinute: tpm)
         } else {
-            "\(BurnFormatting.compactTokens(tokens)) TK"
+            "\(NumberFormatting.compactTokens(tokens)) tk"
         }
         let tokensField = NSTextField(labelWithString: tokensText)
         tokensField.font = Theme.numericFont(size: 11)
@@ -1539,9 +1539,9 @@ private final class TopSessionsRow: NSView {
         tokensField.translatesAutoresizingMaskIntoConstraints = false
 
         let costText = if let cph = liveCostPerHour, cph > 0 {
-            String(format: "$%.2f/hr", cph)
+            NumberFormatting.compactRate(dollarsPerHour: cph)
         } else {
-            String(format: "$%.2f", cost)
+            NumberFormatting.compactDollars(cost)
         }
         let costField = NSTextField(labelWithString: costText)
         costField.font = Theme.numericFont(size: 11)
@@ -1686,12 +1686,12 @@ private final class ProjectGroupRowView: NSView {
         countField.textColor = Theme.textTertiary
         countField.translatesAutoresizingMaskIntoConstraints = false
 
-        let tokens = NSTextField(labelWithString: "\(BurnFormatting.compactTokens(totalTokens)) TK")
+        let tokens = NSTextField(labelWithString: "\(NumberFormatting.compactTokens(totalTokens)) tk")
         tokens.font = Theme.numericFont(size: 12)
         tokens.textColor = Theme.textSecondary
         tokens.translatesAutoresizingMaskIntoConstraints = false
 
-        let cost = NSTextField(labelWithString: String(format: "$%.2f", totalCost))
+        let cost = NSTextField(labelWithString: NumberFormatting.compactDollars(totalCost))
         cost.font = Theme.numericFont(size: 12)
         cost.textColor = Theme.accentMint
         cost.translatesAutoresizingMaskIntoConstraints = false
@@ -1811,14 +1811,6 @@ final class PulseOrb: NSView {
 }
 
 enum BurnFormatting {
-    static func compactTokens(_ count: Int) -> String {
-        switch count {
-        case ..<1000: "\(count)"
-        case ..<1_000_000: String(format: "%.1fk", Double(count) / 1000)
-        default: String(format: "%.2fM", Double(count) / 1_000_000)
-        }
-    }
-
     static func shortModel(_ raw: String) -> String {
         let stripped = raw
             .replacingOccurrences(of: "claude-", with: "")

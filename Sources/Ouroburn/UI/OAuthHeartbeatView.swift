@@ -403,9 +403,9 @@ private final class HeartbeatTooltip: NSView {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d · HH:mm:ss"
         timeLabel.stringValue = formatter.string(from: beat.timestamp)
-        deltaLabel.stringValue = String(format: "Δ $%.2f", beat.dollars)
+        deltaLabel.stringValue = "Δ \(NumberFormatting.compactDollars(beat.dollars))"
         deltaLabel.textColor = accent
-        mtdLabel.stringValue = String(format: "MTD $%.2f", beat.mtd)
+        mtdLabel.stringValue = "MTD \(NumberFormatting.compactDollars(beat.mtd))"
     }
 }
 

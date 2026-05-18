@@ -3,7 +3,7 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// ProjectPath roundtrips already encode `<project>/<session>` — for toast text we want just
-    /// the project's last meaningful segment so the message reads "top: ouroburn (1.2k TK/min)".
+    /// the project's last meaningful segment so the message reads "top: ouroburn (1.2k tk/m)".
     static func shortenSessionLabel(project: String) -> String {
         let segments = ProjectPath.segments(project)
         return segments.last ?? project
@@ -69,30 +69,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     title = "Burn rate alert"
                     accent = Theme.accentPeach
                     if let session = event.topSession, session.tokensPerMinute > 0 {
-                        message = String(
-                            format: "$%.2f/hr · top: %@ (%d TK/min)",
-                            event.costPerHour,
-                            Self.shortenSessionLabel(project: session.projectPath),
-                            Int(session.tokensPerMinute)
-                        )
+                        let label = Self.shortenSessionLabel(project: session.projectPath)
+                        let rate = NumberFormatting.compactRate(tokensPerMinute: session.tokensPerMinute)
+                        message = "\(NumberFormatting.compactRate(dollarsPerHour: event.costPerHour)) · top: \(label) (\(rate))"
                     } else {
-                        message = String(format: "Sustained > $%.2f/hr threshold", event.thresholdUSDPerHour)
+                        message = "Sustained > \(NumberFormatting.compactRate(dollarsPerHour: event.thresholdUSDPerHour)) threshold"
                     }
                 case .dailyPeak:
                     title = "New daily peak"
                     accent = Theme.accentRed
                     let prior = event.previousPeakUSDPerHour ?? 0
+                    let nowRate = NumberFormatting.compactRate(dollarsPerHour: event.costPerHour)
+                    let priorRate = NumberFormatting.compactRate(dollarsPerHour: prior)
                     if let session = event.topSession, session.tokensPerMinute > 0 {
-                        message = String(
-                            format: "$%.2f/hr beats today's prior peak ($%.2f) · top: %@",
-                            event.costPerHour, prior,
-                            Self.shortenSessionLabel(project: session.projectPath)
-                        )
+                        let label = Self.shortenSessionLabel(project: session.projectPath)
+                        message = "\(nowRate) beats today's prior peak (\(priorRate)) · top: \(label)"
                     } else {
-                        message = String(
-                            format: "$%.2f/hr beats today's prior peak ($%.2f)",
-                            event.costPerHour, prior
-                        )
+                        message = "\(nowRate) beats today's prior peak (\(priorRate))"
                     }
                 }
                 ToastWindow.show(title: title, message: message, accent: accent)

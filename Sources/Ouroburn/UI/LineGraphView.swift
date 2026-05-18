@@ -178,8 +178,8 @@ final class LineGraphView: NSView {
         ]
         let peak = peakMetric()
         let maxLabel = switch metric {
-        case .tokens: "\(BurnFormatting.compactTokens(Int(peak))) TK"
-        case .cost: String(format: "$%.2f", peak)
+        case .tokens: "\(NumberFormatting.compactTokens(Int(peak))) tk"
+        case .cost: NumberFormatting.compactDollars(peak)
         }
         NSAttributedString(string: maxLabel, attributes: attrs).draw(at: CGPoint(x: rect.minX, y: rect.maxY - 2))
 
@@ -330,11 +330,11 @@ private final class TooltipView: NSView {
 
     func update(point: TimelinePoint, accent: NSColor) {
         labelTitle.stringValue = point.label
-        labelTokens.stringValue = "\(BurnFormatting.compactTokens(point.tokens)) TK"
+        labelTokens.stringValue = "\(NumberFormatting.compactTokens(point.tokens)) tk"
         labelTokens.textColor = accent
-        labelCost.stringValue = String(format: "$%.2f", point.costUSD)
+        labelCost.stringValue = NumberFormatting.compactDollars(point.costUSD)
         if let session = point.topSession, point.topSessionTokens > 0 {
-            labelSession.stringValue = "Top: \(prettify(session)) (\(BurnFormatting.compactTokens(point.topSessionTokens)) TK)"
+            labelSession.stringValue = "Top: \(prettify(session)) (\(NumberFormatting.compactTokens(point.topSessionTokens)) tk)"
             labelSession.isHidden = false
         } else {
             labelSession.stringValue = ""

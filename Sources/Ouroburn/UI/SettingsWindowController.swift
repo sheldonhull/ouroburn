@@ -306,7 +306,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
         let stack = NSStackView(views: [
             inlineRow("Spike multiplier", control: multiplierField, hint: "live > median × X"),
-            inlineRow("Spike floor (TK/min)", control: minRateField, hint: "ignore below this"),
+            inlineRow("Spike floor (tk/m)", control: minRateField, hint: "ignore below this"),
             inlineRow("Notification cooldown (s)", control: cooldownField, hint: "min 60"),
             inlineRow(
                 "OAuth refresh (min)",
@@ -389,7 +389,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let threshold = Double(toastThresholdField.stringValue) ?? Preferences.default.toastCostThresholdUSDPerHour
         ToastWindow.show(
             title: "Burn rate alert (preview)",
-            message: String(format: "Sustained > $%.2f/hr threshold · sample toast", threshold)
+            message: "Sustained > \(NumberFormatting.compactRate(dollarsPerHour: threshold)) threshold · sample toast"
         )
     }
 
