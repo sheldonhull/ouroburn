@@ -7,6 +7,18 @@ import AppKit
 @MainActor
 final class BillingHistoryWindowController: NSWindowController {
     private let store = BillingSampleStore()
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "EEE · MMM d"
+        return f
+    }()
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
     private let outline = NSOutlineView()
     private var dayRows: [DayRow] = []
     private let timeColumnID = NSUserInterfaceItemIdentifier("time")
@@ -33,7 +45,8 @@ final class BillingHistoryWindowController: NSWindowController {
         super.init(window: window)
         dataSourceProxy.controller = self
         window.contentViewController = makeContentViewController()
-        reload()
+        // Defer first reload to `showOnTop`; constructing the controller without showing the
+        // window was eagerly parsing 3k+ samples on app launch.
     }
 
     @available(*, unavailable)
@@ -136,17 +149,40 @@ final class BillingHistoryWindowController: NSWindowController {
         }
         dayOrder.sort(by: >)
 
+        // Calendar-month-to-date — sum positive consecutive deltas across all samples since the
+        // first of the current calendar month, ignoring resets. Anthropic's `extra_used_usd`
+        // collapses to zero at billing-period rollover, so a mid-month reset would otherwise
+        // make the MTD column appear to shrink. Compute once per reload, indexed by start-of-day.
+        var mtdByDay: [Date: Double] = [:]
+        let monthStart: Date = {
+            let comps = calendar.dateComponents([.year, .month], from: Date())
+            return calendar.date(from: comps) ?? Date.distantPast
+        }()
+        var running: Double = 0
+        var priorForMTD: BillingSample?
+        for entry in paired {
+            if entry.sample.timestamp >= monthStart {
+                if let p = priorForMTD {
+                    let delta = entry.sample.totalUSD - p.totalUSD
+                    if delta > 0 { running += delta }
+                }
+                mtdByDay[calendar.startOfDay(for: entry.sample.timestamp)] = running
+            }
+            priorForMTD = entry.sample
+        }
+
         var rows: [DayRow] = []
         for day in dayOrder {
             let entries = groups[day] ?? []
             let first = entries.first?.sample.totalUSD ?? 0
             let last = entries.last?.sample.totalUSD ?? 0
-            // Within-day MTD growth only. Avoids attributing pre-midnight spend (the gap between
-            // yesterday's last sample and today's first sample) to today.
             let dayDelta = max(0, last - first)
             // Show samples newest-first inside the day.
             let ordered = entries.sorted { $0.sample.timestamp > $1.sample.timestamp }
-            rows.append(DayRow(day: day, samples: ordered, latest: last, dayDelta: dayDelta))
+            // MTD column reflects reset-robust cumulative spend; falls back to the in-day latest
+            // value for days that pre-date the current calendar month (history beyond the month).
+            let mtdValue = mtdByDay[day] ?? last
+            rows.append(DayRow(day: day, samples: ordered, latest: mtdValue, dayDelta: dayDelta))
         }
 
         dayRows = rows
@@ -204,22 +240,23 @@ final class BillingHistoryWindowController: NSWindowController {
     private func dayCell(column id: NSUserInterfaceItemIdentifier, row: DayRow) -> NSView {
         switch id {
         case timeColumnID:
-            let formatter = DateFormatter()
-            formatter.dateFormat = "EEE · MMM d"
             return makeLabel(
-                formatter.string(from: row.day),
+                Self.dayFormatter.string(from: row.day),
                 font: Theme.titleFont(size: 12),
                 color: Theme.textPrimary
             )
         case totalColumnID:
+            // MTD reflects cumulative *spend* — render neutral, not the accent-mint we use for
+            // positive/credit deltas. Otherwise the column reads as "money in" even though it's
+            // money out.
             return makeLabel(
-                String(format: "$%.2f", row.latest),
+                NumberFormatting.compactDollars(row.latest),
                 font: Theme.numericFont(size: 12),
-                color: Theme.accentMint
+                color: Theme.textPrimary
             )
         case deltaColumnID:
             return makeLabel(
-                String(format: "$%.2f", row.dayDelta),
+                NumberFormatting.compactDollars(row.dayDelta),
                 font: Theme.numericFont(size: 12),
                 color: deltaColor(value: row.dayDelta)
             )
@@ -232,7 +269,7 @@ final class BillingHistoryWindowController: NSWindowController {
                 let secs = lastSample.timestamp.timeIntervalSince(firstSample.timestamp)
                 let perHour = row.dayDelta * 3600 / secs
                 return makeLabel(
-                    String(format: "$%.2f", perHour),
+                    NumberFormatting.compactDollars(perHour),
                     font: Theme.numericFont(size: 12),
                     color: deltaColor(value: perHour)
                 )
@@ -250,16 +287,14 @@ final class BillingHistoryWindowController: NSWindowController {
     ) -> NSView {
         switch id {
         case timeColumnID:
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm:ss"
             return makeLabel(
-                formatter.string(from: sample.timestamp),
+                Self.timeFormatter.string(from: sample.timestamp),
                 font: Theme.numericFont(size: 11),
                 color: Theme.textSecondary
             )
         case totalColumnID:
             return makeLabel(
-                String(format: "$%.2f", sample.totalUSD),
+                NumberFormatting.compactDollars(sample.totalUSD),
                 font: Theme.numericFont(size: 11),
                 color: Theme.textPrimary
             )
@@ -269,7 +304,7 @@ final class BillingHistoryWindowController: NSWindowController {
             }
             let delta = sample.totalUSD - prior.totalUSD
             return makeLabel(
-                String(format: "$%.2f", delta),
+                NumberFormatting.compactDollars(delta),
                 font: Theme.numericFont(size: 11),
                 color: deltaColor(value: delta)
             )
@@ -283,7 +318,7 @@ final class BillingHistoryWindowController: NSWindowController {
             }
             let perHour = (sample.totalUSD - prior.totalUSD) * 3600 / elapsed
             return makeLabel(
-                String(format: "$%.2f", perHour),
+                NumberFormatting.compactDollars(perHour),
                 font: Theme.numericFont(size: 11),
                 color: deltaColor(value: perHour)
             )
