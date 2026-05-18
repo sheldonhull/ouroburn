@@ -24,7 +24,7 @@ struct BillingSampleStore {
     let url: URL
     let maxRows: Int
 
-    init(url: URL = BillingSampleStore.defaultURL(), maxRows: Int = 50_000) {
+    init(url: URL = BillingSampleStore.defaultURL(), maxRows: Int = 50000) {
         self.url = url
         self.maxRows = maxRows
     }

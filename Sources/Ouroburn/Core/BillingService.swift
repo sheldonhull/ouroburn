@@ -59,6 +59,7 @@ actor BillingService {
     private var baselinePollInterval: TimeInterval = 5 * 60 // overridden via setPollInterval
     private var consecutiveFailures: Int = 0 // doubles the cool-down each time, capped at the ceiling
     private var lastStatusMessage: String? // human-readable billing status surfaced into the snapshot
+    private var lastHealth: BillingHealth = .unknown
     /// While the popover is open we shorten the floor so the user's monthly tile keeps up. Still
     /// rides on top of `consecutiveFailures` backoff and the upstream 429 cool-down — this only
     /// changes the *baseline*, not the cooldown semantics.
@@ -116,6 +117,7 @@ actor BillingService {
 
         guard claudeCodeToken != nil || oauthToken != nil || adminKey != nil else {
             lastStatusMessage = "no token · run `claude login` (PKCE) or paste Admin API key"
+            lastHealth = .tokenMissing
             return lastReport?.totalUSD
         }
 
@@ -164,12 +166,18 @@ actor BillingService {
 
     private func registerSuccess() {
         consecutiveFailures = 0
+        lastHealth = .ok
     }
 
     private func registerFailure() {
         // Cap the exponent so multiplier doesn't overflow; the ceiling clamps the actual delay.
         if currentPollInterval() < Self.backoffCeilingSeconds {
             consecutiveFailures += 1
+        }
+        // Preserve any specific health classification set by the backend (auth, rateLimited).
+        // Only fall back to `.transient` when the failure didn't already carry a sharper reason.
+        if lastHealth == .ok || lastHealth == .unknown || lastHealth == .tokenMissing {
+            lastHealth = .transient(reason: lastStatusMessage ?? "fetch failed")
         }
     }
 
@@ -256,7 +264,14 @@ actor BillingService {
 
     /// Last human-readable billing status (success summary, 429 backoff timer, auth failure
     /// hint). Surfaced into the popover footer when there's no cached dollar figure yet.
-    func currentStatusMessage() -> String? { lastStatusMessage }
+    func currentStatusMessage() -> String? {
+        lastStatusMessage
+    }
+
+    /// Structured fetch health so the popover can paint a green/red/blinking indicator.
+    func currentHealth() -> BillingHealth {
+        lastHealth
+    }
 
     private func resolveSecret(envKey: String, account: String) -> String? {
         if let value = environment[envKey], !value.isEmpty { return value }
@@ -321,22 +336,30 @@ actor BillingService {
                     "OAuth usage 429 — backing off for \(Int(cooldown))s"
                 )
                 lastStatusMessage = "rate-limited · retry in \(formatMinutes(cooldown))"
+                lastHealth = .rateLimited(retryAfterSeconds: cooldown)
             case let .badStatus(code):
                 Log.error(Log.pricing, "OAuth usage status \(code)")
-                lastStatusMessage = code == 401 || code == 403
-                    ? "unauthorized (HTTP \(code)) · re-run `claude login`"
-                    : "/api/oauth/usage HTTP \(code)"
+                if code == 401 || code == 403 || code == 404 {
+                    lastStatusMessage = "token rejected (HTTP \(code)) · re-link account"
+                    lastHealth = .authInvalid(statusCode: code)
+                } else {
+                    lastStatusMessage = "/api/oauth/usage HTTP \(code)"
+                    lastHealth = .transient(reason: "HTTP \(code)")
+                }
             case let .transport(message):
                 Log.error(Log.pricing, "OAuth usage transport error: \(message)")
                 lastStatusMessage = "network error · \(message)"
+                lastHealth = .transient(reason: message)
             case .decodeFailure:
                 Log.error(Log.pricing, "OAuth usage payload decode failed")
                 lastStatusMessage = "decode failed · upstream payload changed?"
+                lastHealth = .transient(reason: "decode failed")
             }
             return nil
         } catch {
             Log.error(Log.pricing, "OAuth usage fetch failed: \(error.localizedDescription)")
             lastStatusMessage = "fetch failed · \(error.localizedDescription)"
+            lastHealth = .transient(reason: error.localizedDescription)
             return nil
         }
     }
@@ -625,6 +648,23 @@ private struct EnterpriseOrg {
             }
         }
     }
+}
+
+/// Structured result of the most recent billing fetch. Lets the popover paint a meaningful
+/// indicator color without re-parsing `currentStatusMessage`.
+enum BillingHealth: Sendable, Equatable {
+    /// No fetch attempted yet (or first run with no cache).
+    case unknown
+    /// No usable token anywhere.
+    case tokenMissing
+    /// Last fetch returned 2xx.
+    case ok
+    /// Upstream rejected the token (401/403/404). Indicator should blink red — token is bad.
+    case authInvalid(statusCode: Int)
+    /// 429 with cool-down.
+    case rateLimited(retryAfterSeconds: TimeInterval)
+    /// Transport, decode, or 5xx failure.
+    case transient(reason: String)
 }
 
 struct BillingReport: Codable, Sendable {

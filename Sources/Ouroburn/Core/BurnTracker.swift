@@ -115,10 +115,18 @@ struct LiveSnapshot: Sendable {
 /// `Preferences.toastSustainedSeconds`. Carries the breach value plus the top session so the UI
 /// layer can render a "what's burning" message without re-deriving it.
 struct ToastEvent: Sendable {
+    enum Kind: Sendable {
+        case threshold
+        case dailyPeak
+    }
+
+    let kind: Kind
     let costPerHour: Double
     let thresholdUSDPerHour: Double
     let topSession: SessionVelocity?
     let firstBreachAt: Date
+    /// Today's prior peak delta-derived $/hr — populated only for `dailyPeak` events.
+    let previousPeakUSDPerHour: Double?
 }
 
 /// Orchestrator: every 60 seconds, reload all transcripts, recompute aggregates for the active
@@ -134,6 +142,9 @@ final class BurnTracker: @unchecked Sendable {
     /// Fires once per breach when live USD/hr stays at/above threshold for the sustained window.
     /// Cooldown of `notificationCooldownSeconds` applies between fires.
     var onToast: ((ToastEvent) -> Void)?
+    /// Fires after every billing fetch — success or failure — so the popover indicator can
+    /// reflect token state without re-polling the billing actor.
+    var onBillingHealth: ((BillingHealth) -> Void)?
 
     static let pollInterval: TimeInterval = 60
     static let burnWindowSeconds: TimeInterval = 5 * 60
@@ -147,6 +158,7 @@ final class BurnTracker: @unchecked Sendable {
     private let pricingService: PricingService
     private let billingService: BillingService?
     private let cache: DiskCache
+    private let sampleStore: BillingSampleStore
     private let queue = DispatchQueue(label: "ouroburn.burn-tracker", qos: .utility)
     private let liveQueue = DispatchQueue(label: "ouroburn.burn-tracker.live", qos: .userInitiated)
     private let state = OSAllocatedUnfairLock<State>(initialState: State())
@@ -181,8 +193,12 @@ final class BurnTracker: @unchecked Sendable {
         var toastEnabled: Bool = false
         var toastCostThreshold: Double = 8
         var toastSustainedSeconds: Double = 30
-        var toastDurationSeconds: Double = 6
+        var toastPeakAlertEnabled: Bool = true
         var notificationCooldownSeconds: Double = 600
+        /// Highest delta-derived $/hr we've already announced for the current local day. Reset on
+        /// day rollover. Prevents repeated peak toasts when the same sample is read multiple times.
+        var lastAnnouncedPeakUSDPerHour: Double = 0
+        var lastPeakDay: String = ""
         /// First moment the live rate exceeded `toastCostThreshold` in the current breach window.
         /// Reset whenever the rate drops back below. Once `now - firstBreach >= sustained`, the
         /// `onToast` callback fires and `lastToastFiredAt` advances to enforce cooldown.
@@ -197,7 +213,7 @@ final class BurnTracker: @unchecked Sendable {
             $0.toastEnabled = prefs.toastEnabled
             $0.toastCostThreshold = prefs.toastCostThresholdUSDPerHour
             $0.toastSustainedSeconds = prefs.toastSustainedSeconds
-            $0.toastDurationSeconds = prefs.toastDurationSeconds
+            $0.toastPeakAlertEnabled = prefs.toastPeakAlertEnabled
             $0.notificationCooldownSeconds = prefs.notificationCooldownSeconds
             // Threshold or enabled flag changed — reset the breach tracker so the next breach
             // starts fresh rather than firing on stale state.
@@ -206,11 +222,6 @@ final class BurnTracker: @unchecked Sendable {
         if let billingService {
             Task { await billingService.setPollInterval(minutes: prefs.oauthRefreshMinutes) }
         }
-    }
-
-    /// Convenience for the UI layer (settings preview button) — current toast duration.
-    func currentToastDurationSeconds() -> Double {
-        state.withLock { $0.toastDurationSeconds }
     }
 
     /// Toggles the OAuth billing foreground boost. Called when the popover opens/closes so the
@@ -237,12 +248,14 @@ final class BurnTracker: @unchecked Sendable {
         loader: JSONLLoader = JSONLLoader(),
         pricingService: PricingService,
         billingService: BillingService? = nil,
-        cache: DiskCache
+        cache: DiskCache,
+        sampleStore: BillingSampleStore = BillingSampleStore()
     ) {
         self.loader = loader
         self.pricingService = pricingService
         self.billingService = billingService
         self.cache = cache
+        self.sampleStore = sampleStore
     }
 
     /// Records the active mode for the next poll cycle. The view layer renders the new mode
@@ -438,10 +451,12 @@ final class BurnTracker: @unchecked Sendable {
                 if sustainedFor >= state.toastSustainedSeconds, cooldownOK {
                     state.lastToastFiredAt = now
                     let event = ToastEvent(
+                        kind: .threshold,
                         costPerHour: snapshot.costPerHour,
                         thresholdUSDPerHour: state.toastCostThreshold,
                         topSession: snapshot.perSession.first,
-                        firstBreachAt: firstBreach
+                        firstBreachAt: firstBreach,
+                        previousPeakUSDPerHour: nil
                     )
                     return (snapshot, event)
                 }
@@ -523,6 +538,7 @@ final class BurnTracker: @unchecked Sendable {
         Task { [weak self] in
             let total = await billingService.currentMonthBilledUSD()
             let status = await billingService.currentStatusMessage()
+            let health = await billingService.currentHealth()
             guard let self else { return }
             let updated = state.withLock { state -> TrackerSnapshot? in
                 state.billedMonthUSD = total
@@ -533,6 +549,78 @@ final class BurnTracker: @unchecked Sendable {
                 return next
             }
             if let updated { onUpdate?(updated) }
+            onBillingHealth?(health)
+            checkDailyPeak()
+        }
+    }
+
+    /// Inspect today's OAuth billing samples for a new local peak in per-interval $/hr. Fires
+    /// `onToast` when today's latest delta beats every prior delta we've seen today. Idempotent —
+    /// re-reading the same sample won't re-fire (we track the last-announced peak in state).
+    private func checkDailyPeak() {
+        let calendar = Calendar.current
+        let today = Aggregator.dayKey(for: Date(), calendar: calendar)
+        let samples = sampleStore.load()
+            .filter { calendar.isDateInToday($0.timestamp) }
+            .sorted { $0.timestamp < $1.timestamp }
+        guard samples.count >= 2 else { return }
+
+        struct Pair { let rate: Double; let amount: Double; let at: Date }
+        var pairs: [Pair] = []
+        pairs.reserveCapacity(samples.count - 1)
+        for index in 1 ..< samples.count {
+            let prior = samples[index - 1]
+            let current = samples[index]
+            let amount = max(0, current.totalUSD - prior.totalUSD)
+            let minutes = max(current.timestamp.timeIntervalSince(prior.timestamp) / 60, 1.0 / 60.0)
+            let rate = amount / minutes * 60 // $/hr
+            pairs.append(Pair(rate: rate, amount: amount, at: current.timestamp))
+        }
+        guard let latest = pairs.last, latest.amount > 0 else { return }
+        let priorMaxRate = pairs.dropLast().map(\.rate).max() ?? 0
+
+        let live = state.withLock { state -> LiveSnapshot? in
+            // Compute a fresh live snapshot for top-session annotation. Cheap because the buffer
+            // caps at the rolling 60s window.
+            Self.computeLive(samples: state.liveSamples, table: state.pricingTable, now: Date())
+        }
+        let now = Date()
+        let event = state.withLock { state -> ToastEvent? in
+            // Day rolled over: clear the tracker so the first peak of the new day fires.
+            if state.lastPeakDay != today {
+                state.lastPeakDay = today
+                state.lastAnnouncedPeakUSDPerHour = 0
+            }
+            guard state.toastPeakAlertEnabled else { return nil }
+            guard latest.rate > priorMaxRate, latest.rate > state.lastAnnouncedPeakUSDPerHour else {
+                return nil
+            }
+            let cooldownOK: Bool = if let last = state.lastToastFiredAt {
+                now.timeIntervalSince(last) >= state.notificationCooldownSeconds
+            } else {
+                true
+            }
+            guard cooldownOK else { return nil }
+            state.lastAnnouncedPeakUSDPerHour = latest.rate
+            state.lastToastFiredAt = now
+            return ToastEvent(
+                kind: .dailyPeak,
+                costPerHour: latest.rate,
+                thresholdUSDPerHour: priorMaxRate,
+                topSession: live?.perSession.first,
+                firstBreachAt: latest.at,
+                previousPeakUSDPerHour: priorMaxRate
+            )
+        }
+        if let event {
+            Log.info(
+                Log.tracker,
+                String(
+                    format: "Daily peak alert: $%.2f/hr (prior peak $%.2f/hr)",
+                    event.costPerHour, event.previousPeakUSDPerHour ?? 0
+                )
+            )
+            onToast?(event)
         }
     }
 

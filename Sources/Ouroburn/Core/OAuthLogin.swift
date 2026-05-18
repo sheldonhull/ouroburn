@@ -61,8 +61,7 @@ enum OAuthLogin {
         let completion: () async throws -> StoredCredential = {
             defer { Task { await server.shutdown() } }
             let code = try await server.awaitCode()
-            let token = try await exchangeCode(code: code, verifier: verifier, redirectURI: redirectURI, state: state)
-            return token
+            return try await exchangeCode(code: code, verifier: verifier, redirectURI: redirectURI, state: state)
         }
         return (authURL, completion)
     }
@@ -121,7 +120,7 @@ enum OAuthLogin {
             throw LoginError.emptyAccessToken
         }
         let refresh = (dict["refresh_token"] as? String) ?? ""
-        let expiresAt: Date = if let absolute = dict["expires_at"] as? Double, absolute > 0 {
+        let expiresAt = if let absolute = dict["expires_at"] as? Double, absolute > 0 {
             Date(timeIntervalSince1970: absolute / 1000)
         } else if let seconds = dict["expires_in"] as? Double, seconds > 0 {
             Date().addingTimeInterval(seconds)
@@ -164,7 +163,10 @@ struct StoredCredential: Codable, Sendable {
     let refreshToken: String
     let expiresAt: Date
 
-    var isExpired: Bool { Date() >= expiresAt }
+    var isExpired: Bool {
+        Date() >= expiresAt
+    }
+
     func expiresWithin(_ interval: TimeInterval) -> Bool {
         Date().addingTimeInterval(interval) >= expiresAt
     }

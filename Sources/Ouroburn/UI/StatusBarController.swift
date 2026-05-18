@@ -1,7 +1,7 @@
 import AppKit
 
 @MainActor
-final class StatusBarController {
+final class StatusBarController: NSObject, NSMenuItemValidation {
     var onShowSettings: (() -> Void)?
     var onRevealLogs: (() -> Void)?
     var onLoginRequested: (() -> Void)?
@@ -19,6 +19,7 @@ final class StatusBarController {
         item = NSStatusBar.system.statusItem(withLength: 28)
         iconView = OuroborosView(frame: NSRect(x: 0, y: 0, width: 22, height: 22))
         iconView.translatesAutoresizingMaskIntoConstraints = false
+        super.init()
 
         if let button = item.button {
             button.addSubview(iconView)
@@ -63,6 +64,10 @@ final class StatusBarController {
 
     func applyLive(snapshot: LiveSnapshot) {
         metrics.applyLive(snapshot: snapshot)
+    }
+
+    func applyBillingHealth(_ health: BillingHealth) {
+        metrics.applyBillingHealth(health)
     }
 
     func setRefreshState(_ state: RefreshState) {
@@ -111,6 +116,11 @@ final class StatusBarController {
 
     private func buildContextMenu() -> NSMenu {
         let menu = NSMenu()
+        // Without `autoenablesItems = false`, NSMenu validates each item against the first
+        // responder. On a popUp() from a status bar button, the responder chain often skips this
+        // controller, leaving every item disabled. Hard-enable: every menu item has an explicit
+        // target+action, so framework validation is redundant.
+        menu.autoenablesItems = false
         menu.addItem(makeMenuItem(title: "Open ouroburn", symbol: "flame", action: #selector(openPopover(_:))))
         menu.addItem(makeMenuItem(
             title: "Refresh now",
@@ -125,11 +135,7 @@ final class StatusBarController {
             action: #selector(revealLogs(_:))
         ))
         menu.addItem(.separator())
-        menu.addItem(makeMenuItem(
-            title: "Quit ouroburn",
-            symbol: "power",
-            action: #selector(NSApplication.terminate(_:))
-        ))
+        menu.addItem(makeMenuItem(title: "Quit ouroburn", symbol: "power", action: #selector(quitApp(_:))))
         return menu
     }
 
@@ -138,9 +144,22 @@ final class StatusBarController {
         tracker.forceRefresh()
     }
 
+    @objc private func quitApp(_: Any?) {
+        Log.info(Log.ui, "Quit menu item triggered")
+        NSApp.terminate(nil)
+    }
+
+    /// Belt-and-suspenders against NSMenu's responder-chain validation: every menu item we build
+    /// targets methods on this controller, so each one is unconditionally valid. autoenablesItems
+    /// is already off, but leaving this in lets us flip it back on later without re-debugging.
+    nonisolated func validateMenuItem(_: NSMenuItem) -> Bool {
+        true
+    }
+
     private func makeMenuItem(title: String, symbol: String, action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
+        item.isEnabled = true
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
             image.isTemplate = true
             item.image = image

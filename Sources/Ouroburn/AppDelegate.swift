@@ -58,25 +58,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tracker.onLiveUpdate = { [weak statusBar] live in
             DispatchQueue.main.async { statusBar?.applyLive(snapshot: live) }
         }
-        tracker.onToast = { [weak tracker] event in
+        tracker.onBillingHealth = { [weak statusBar] health in
+            DispatchQueue.main.async { statusBar?.applyBillingHealth(health) }
+        }
+        tracker.onToast = { event in
             DispatchQueue.main.async {
-                let title = "Burn rate alert"
-                let session = event.topSession
-                let message: String = if let session, session.tokensPerMinute > 0 {
-                    String(
-                        format: "$%.2f/hr · top: %@ (%d TK/min)",
-                        event.costPerHour,
-                        Self.shortenSessionLabel(project: session.projectPath),
-                        Int(session.tokensPerMinute)
-                    )
-                } else {
-                    String(format: "Sustained > $%.2f/hr threshold", event.thresholdUSDPerHour)
+                let (title, message, accent): (String, String, NSColor)
+                switch event.kind {
+                case .threshold:
+                    title = "Burn rate alert"
+                    accent = Theme.accentPeach
+                    if let session = event.topSession, session.tokensPerMinute > 0 {
+                        message = String(
+                            format: "$%.2f/hr · top: %@ (%d TK/min)",
+                            event.costPerHour,
+                            Self.shortenSessionLabel(project: session.projectPath),
+                            Int(session.tokensPerMinute)
+                        )
+                    } else {
+                        message = String(format: "Sustained > $%.2f/hr threshold", event.thresholdUSDPerHour)
+                    }
+                case .dailyPeak:
+                    title = "New daily peak"
+                    accent = Theme.accentRed
+                    let prior = event.previousPeakUSDPerHour ?? 0
+                    if let session = event.topSession, session.tokensPerMinute > 0 {
+                        message = String(
+                            format: "$%.2f/hr beats today's prior peak ($%.2f) · top: %@",
+                            event.costPerHour, prior,
+                            Self.shortenSessionLabel(project: session.projectPath)
+                        )
+                    } else {
+                        message = String(
+                            format: "$%.2f/hr beats today's prior peak ($%.2f)",
+                            event.costPerHour, prior
+                        )
+                    }
                 }
-                ToastWindow.show(
-                    title: title,
-                    message: message,
-                    durationSeconds: tracker?.currentToastDurationSeconds() ?? 6
-                )
+                ToastWindow.show(title: title, message: message, accent: accent)
             }
         }
         statusBar.onShowSettings = { [self] in

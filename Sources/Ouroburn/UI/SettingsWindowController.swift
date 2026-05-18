@@ -19,7 +19,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let toastEnabledSwitch = NSSwitch()
     private let toastThresholdField = NSTextField()
     private let toastSustainedField = NSTextField()
-    private let toastDurationField = NSTextField()
+    private let toastPeakAlertSwitch = NSSwitch()
+    private let launchAtLoginSwitch = NSSwitch()
     private let toastPreviewButton = NSButton(title: "Preview", target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: " ")
@@ -36,12 +37,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         self.onPreferencesSaved = onPreferencesSaved
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 820),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 940),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.minSize = NSSize(width: 640, height: 720)
+        window.minSize = NSSize(width: 640, height: 880)
         window.title = "ouroburn settings"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
@@ -81,7 +82,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private func makeContentViewController() -> NSViewController {
         let vc = NSViewController()
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 540, height: 580))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 720, height: 940))
         root.wantsLayer = true
         root.layer?.backgroundColor = Theme.background.cgColor
 
@@ -89,22 +90,33 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             Theme.glowAttributedTitle("settings", color: Theme.accentBlue, font: Theme.titleFont(size: 26)))
         title.translatesAutoresizingMaskIntoConstraints = false
 
-        let subtitle = NSTextField(labelWithString: "Tune the burn — verify what's running.")
-        subtitle.font = Theme.bodyFont(size: 12)
-        subtitle.textColor = Theme.textSecondary
-        subtitle.translatesAutoresizingMaskIntoConstraints = false
-
         let secretsCard = makeSecretsCard()
         let thresholdsCard = makeThresholdsCard()
         let alertsCard = makeAlertsCard()
+        let appCard = makeAppCard()
         let infoCard = makeInfoCard()
 
-        let stack = NSStackView(views: [secretsCard, thresholdsCard, alertsCard, infoCard])
+        // Scrollable card list — guarantees the Save row stays visible at the bottom regardless
+        // of how tall the cards grow or how short the user resizes the window. Cards push the
+        // scrollview's intrinsic content height; the scroll wrapper clips when needed.
+        let stack = NSStackView(views: [secretsCard, thresholdsCard, alertsCard, appCard, infoCard])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
         stack.distribution = .fill
         stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.autohidesScrollers = true
+
+        let document = NSView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        scroll.documentView = document
 
         saveButton.bezelStyle = .rounded
         saveButton.target = self
@@ -117,20 +129,28 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
         root.addSubview(title)
-        root.addSubview(subtitle)
-        root.addSubview(stack)
+        root.addSubview(scroll)
         root.addSubview(saveButton)
         root.addSubview(statusLabel)
 
         NSLayoutConstraint.activate([
-            title.topAnchor.constraint(equalTo: root.topAnchor, constant: 22),
+            title.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
             title.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 22),
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 4),
-            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
 
-            stack.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 18),
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 22),
-            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -22),
+            scroll.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 12),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 22),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -22),
+            scroll.bottomAnchor.constraint(equalTo: saveButton.topAnchor, constant: -10),
+
+            document.topAnchor.constraint(equalTo: scroll.topAnchor),
+            document.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            document.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.widthAnchor),
+
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 4),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -8),
 
             saveButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -22),
             saveButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16),
@@ -145,22 +165,19 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     private func makeSecretsCard() -> NSView {
-        let card = card(
-            title: "Tokens",
-            subtitle: "Stored in the macOS keychain. Env vars override these. Paste persists on Save or field commit."
-        )
+        let card = card(title: "Tokens", subtitle: nil)
 
-        let oauthLabel = makeFieldLabel("CLAUDE_OAUTH_TOKEN")
+        let oauthLabel = makeFieldLabel("Claude OAuth")
         oauthField.translatesAutoresizingMaskIntoConstraints = false
-        oauthField.placeholderString = "Claude OAuth bearer (used for /api/oauth/usage + claude.ai)"
+        oauthField.placeholderString = "Bearer token"
         oauthField.delegate = self
         oauthField.target = self
         oauthField.action = #selector(secretFieldCommitted(_:))
         oauthIndicator.translatesAutoresizingMaskIntoConstraints = false
 
-        let adminLabel = makeFieldLabel("ANTHROPIC_ADMIN_API_KEY")
+        let adminLabel = makeFieldLabel("Anthropic admin key")
         adminField.translatesAutoresizingMaskIntoConstraints = false
-        adminField.placeholderString = "sk-ant-admin01-…  (Anthropic admin API)"
+        adminField.placeholderString = "sk-ant-admin01-…"
         adminField.delegate = self
         adminField.target = self
         adminField.action = #selector(secretFieldCommitted(_:))
@@ -183,21 +200,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         adminRow.spacing = 6
         adminRow.translatesAutoresizingMaskIntoConstraints = false
 
-        let revealLogs = makeButton(title: "Reveal logs", action: #selector(revealLogFolder(_:)))
-        let resetCache = makeButton(title: "Reset cache", action: #selector(resetCache(_:)))
-        let actions = NSStackView(views: [revealLogs, resetCache])
-        actions.orientation = .horizontal
-        actions.spacing = 8
-        actions.translatesAutoresizingMaskIntoConstraints = false
-
-        let body = NSStackView(views: [oauthLabel, oauthRow, adminLabel, adminRow, actions])
+        let body = NSStackView(views: [oauthLabel, oauthRow, adminLabel, adminRow])
         body.orientation = .vertical
         body.alignment = .leading
         body.spacing = 6
         body.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(body)
         NSLayoutConstraint.activate([
-            body.topAnchor.constraint(equalTo: card.topAnchor, constant: 38),
+            body.topAnchor.constraint(equalTo: card.topAnchor, constant: 30),
             body.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
             body.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
             body.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
@@ -270,7 +280,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     private func makeThresholdsCard() -> NSView {
-        let card = card(title: "Tuning", subtitle: "Spike thresholds & default view")
+        let card = card(title: "Tuning", subtitle: nil)
 
         multiplierField.translatesAutoresizingMaskIntoConstraints = false
         multiplierField.placeholderString = "2.0"
@@ -323,10 +333,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     /// drives the (existing) NSUserNotification; this card drives the floating in-app toast — two
     /// distinct signals so users can run one without the other.
     private func makeAlertsCard() -> NSView {
-        let card = card(
-            title: "Alerts",
-            subtitle: "Floating in-app toast when sustained $/hr crosses your threshold."
-        )
+        let card = card(title: "Alerts", subtitle: nil)
 
         toastEnabledSwitch.translatesAutoresizingMaskIntoConstraints = false
         toastEnabledSwitch.target = self
@@ -340,9 +347,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         toastSustainedField.placeholderString = "30"
         toastSustainedField.alignment = .right
 
-        toastDurationField.translatesAutoresizingMaskIntoConstraints = false
-        toastDurationField.placeholderString = "6"
-        toastDurationField.alignment = .right
+        toastPeakAlertSwitch.translatesAutoresizingMaskIntoConstraints = false
 
         toastPreviewButton.bezelStyle = .rounded
         toastPreviewButton.controlSize = .small
@@ -355,7 +360,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             inlineRow("Show toast", control: toastEnabledSwitch, hint: "fires only while ouroburn is running"),
             inlineRow("Threshold ($/hr)", control: toastThresholdField, hint: "live USD/hr ≥ this"),
             inlineRow("Sustained (s)", control: toastSustainedField, hint: "must hold for at least"),
-            inlineRow("Toast duration (s)", control: toastDurationField, hint: "auto-dismiss timer"),
+            inlineRow(
+                "Alert on new daily peak",
+                control: toastPeakAlertSwitch,
+                hint: "fires when an OAuth sample beats today's prior max $/hr"
+            ),
             inlineRow("Preview", control: toastPreviewButton, hint: "fires a sample toast now")
         ])
         stack.orientation = .vertical
@@ -377,32 +386,61 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc private func previewToastPressed(_: Any?) {
-        let duration = Double(toastDurationField.stringValue) ?? Preferences.default.toastDurationSeconds
         let threshold = Double(toastThresholdField.stringValue) ?? Preferences.default.toastCostThresholdUSDPerHour
         ToastWindow.show(
             title: "Burn rate alert (preview)",
-            message: String(format: "Sustained > $%.2f/hr threshold · sample toast", threshold),
-            durationSeconds: max(2, min(15, duration))
+            message: String(format: "Sustained > $%.2f/hr threshold · sample toast", threshold)
         )
+    }
+
+    private func makeAppCard() -> NSView {
+        let card = card(title: "App", subtitle: nil)
+        launchAtLoginSwitch.translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView(views: [
+            inlineRow("Launch at login", control: launchAtLoginSwitch, hint: "")
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 38),
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+        ])
+        return card
     }
 
     private func makeInfoCard() -> NSView {
         let card = card(title: "Diagnostics", subtitle: nil)
         let label = NSTextField(wrappingLabelWithString: """
-        Log file:  \(logFolderURL.path)
+        Log:       \(logFolderURL.path)
         Snapshot:  \(cacheURL.path)
-        Billing:   set CLAUDE_OAUTH_TOKEN (Enterprise) or ANTHROPIC_ADMIN_API_KEY for billed MTD.
-                   Raw enterprise response saved to ~/Library/Caches/ouroburn/enterprise-usage.json.
         """)
-        label.font = Theme.bodyFont(size: 11)
-        label.textColor = Theme.textSecondary
+        label.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        label.textColor = Theme.textTertiary
         label.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(label)
+
+        let revealLogs = makeButton(title: "Reveal logs", action: #selector(revealLogFolder(_:)))
+        let resetCache = makeButton(title: "Reset cache", action: #selector(resetCache(_:)))
+        let actions = NSStackView(views: [revealLogs, resetCache])
+        actions.orientation = .horizontal
+        actions.spacing = 8
+        actions.translatesAutoresizingMaskIntoConstraints = false
+
+        let body = NSStackView(views: [label, actions])
+        body.orientation = .vertical
+        body.alignment = .leading
+        body.spacing = 8
+        body.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(body)
         NSLayoutConstraint.activate([
-            label.topAnchor.constraint(equalTo: card.topAnchor, constant: 38),
-            label.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
-            label.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            label.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+            body.topAnchor.constraint(equalTo: card.topAnchor, constant: 30),
+            body.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            body.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            body.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
         ])
         return card
     }
@@ -510,7 +548,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         toastEnabledSwitch.state = prefs.toastEnabled ? .on : .off
         toastThresholdField.stringValue = String(format: "%.2f", prefs.toastCostThresholdUSDPerHour)
         toastSustainedField.stringValue = String(Int(prefs.toastSustainedSeconds))
-        toastDurationField.stringValue = String(Int(prefs.toastDurationSeconds))
+        toastPeakAlertSwitch.state = prefs.toastPeakAlertEnabled ? .on : .off
+        launchAtLoginSwitch.state = LaunchAtLogin.isEnabled() ? .on : .off
         if let index = ViewMode.allCases.firstIndex(of: prefs.defaultMode) {
             modePopup.selectItem(at: index)
         }
@@ -533,9 +572,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             ?? Preferences.default.toastCostThresholdUSDPerHour
         let toastSustained = Double(toastSustainedField.stringValue)
             ?? Preferences.default.toastSustainedSeconds
-        let toastDuration = Double(toastDurationField.stringValue)
-            ?? Preferences.default.toastDurationSeconds
 
+        let wantsLaunchAtLogin = launchAtLoginSwitch.state == .on
         let prefs = Preferences(
             spikeMultiplier: max(1.05, multiplier),
             spikeMinimumRate: max(0, minRate),
@@ -545,9 +583,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             toastEnabled: toastEnabledSwitch.state == .on,
             toastCostThresholdUSDPerHour: max(0.1, toastThreshold),
             toastSustainedSeconds: min(max(5, toastSustained), 600),
-            toastDurationSeconds: min(max(2, toastDuration), 15)
+            toastPeakAlertEnabled: toastPeakAlertSwitch.state == .on,
+            launchAtLoginEnabled: wantsLaunchAtLogin
         )
         PreferencesStore.save(prefs)
+        LaunchAtLogin.apply(enabled: wantsLaunchAtLogin) { [weak self] error in
+            guard let self else { return }
+            if let error {
+                statusLabel.stringValue = "Launch-at-login: \(error.localizedDescription)"
+                launchAtLoginSwitch.state = LaunchAtLogin.isEnabled() ? .on : .off
+            }
+        }
 
         let oauth = oauthField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if oauth.isEmpty {

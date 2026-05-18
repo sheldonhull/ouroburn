@@ -37,7 +37,9 @@ final class BillingHistoryWindowController: NSWindowController {
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     func showOnTop() {
         reload()
@@ -162,7 +164,7 @@ final class BillingHistoryWindowController: NSWindowController {
         }
     }
 
-    // Outline data hooks called from the proxy.
+    /// Outline data hooks called from the proxy.
     fileprivate func numberOfChildren(of item: Any?) -> Int {
         if item == nil { return dayRows.count }
         if let day = item as? DayRow { return day.samples.count }
@@ -204,14 +206,23 @@ final class BillingHistoryWindowController: NSWindowController {
         case timeColumnID:
             let formatter = DateFormatter()
             formatter.dateFormat = "EEE · MMM d"
-            return makeLabel(formatter.string(from: row.day), font: Theme.titleFont(size: 12),
-                             color: Theme.textPrimary)
+            return makeLabel(
+                formatter.string(from: row.day),
+                font: Theme.titleFont(size: 12),
+                color: Theme.textPrimary
+            )
         case totalColumnID:
-            return makeLabel(String(format: "$%.2f", row.latest), font: Theme.numericFont(size: 12),
-                             color: Theme.accentMint)
+            return makeLabel(
+                String(format: "$%.2f", row.latest),
+                font: Theme.numericFont(size: 12),
+                color: Theme.accentMint
+            )
         case deltaColumnID:
-            return makeLabel(String(format: "$%.2f", row.dayDelta), font: Theme.numericFont(size: 12),
-                             color: deltaColor(value: row.dayDelta))
+            return makeLabel(
+                String(format: "$%.2f", row.dayDelta),
+                font: Theme.numericFont(size: 12),
+                color: deltaColor(value: row.dayDelta)
+            )
         case rateColumnID:
             // Day-level "$/hr" uses sample span / dollar delta for that day.
             if let firstSample = row.samples.last?.sample,
@@ -220,9 +231,11 @@ final class BillingHistoryWindowController: NSWindowController {
             {
                 let secs = lastSample.timestamp.timeIntervalSince(firstSample.timestamp)
                 let perHour = row.dayDelta * 3600 / secs
-                return makeLabel(String(format: "$%.2f", perHour),
-                                 font: Theme.numericFont(size: 12),
-                                 color: deltaColor(value: perHour))
+                return makeLabel(
+                    String(format: "$%.2f", perHour),
+                    font: Theme.numericFont(size: 12),
+                    color: deltaColor(value: perHour)
+                )
             }
             return makeLabel("—", font: Theme.numericFont(size: 12), color: Theme.textTertiary)
         default:
@@ -239,21 +252,27 @@ final class BillingHistoryWindowController: NSWindowController {
         case timeColumnID:
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm:ss"
-            return makeLabel(formatter.string(from: sample.timestamp),
-                             font: Theme.numericFont(size: 11),
-                             color: Theme.textSecondary)
+            return makeLabel(
+                formatter.string(from: sample.timestamp),
+                font: Theme.numericFont(size: 11),
+                color: Theme.textSecondary
+            )
         case totalColumnID:
-            return makeLabel(String(format: "$%.2f", sample.totalUSD),
-                             font: Theme.numericFont(size: 11),
-                             color: Theme.textPrimary)
+            return makeLabel(
+                String(format: "$%.2f", sample.totalUSD),
+                font: Theme.numericFont(size: 11),
+                color: Theme.textPrimary
+            )
         case deltaColumnID:
             guard let prior else {
                 return makeLabel("—", font: Theme.numericFont(size: 11), color: Theme.textTertiary)
             }
             let delta = sample.totalUSD - prior.totalUSD
-            return makeLabel(String(format: "$%.2f", delta),
-                             font: Theme.numericFont(size: 11),
-                             color: deltaColor(value: delta))
+            return makeLabel(
+                String(format: "$%.2f", delta),
+                font: Theme.numericFont(size: 11),
+                color: deltaColor(value: delta)
+            )
         case rateColumnID:
             guard let prior else {
                 return makeLabel("—", font: Theme.numericFont(size: 11), color: Theme.textTertiary)
@@ -263,9 +282,11 @@ final class BillingHistoryWindowController: NSWindowController {
                 return makeLabel("—", font: Theme.numericFont(size: 11), color: Theme.textTertiary)
             }
             let perHour = (sample.totalUSD - prior.totalUSD) * 3600 / elapsed
-            return makeLabel(String(format: "$%.2f", perHour),
-                             font: Theme.numericFont(size: 11),
-                             color: deltaColor(value: perHour))
+            return makeLabel(
+                String(format: "$%.2f", perHour),
+                font: Theme.numericFont(size: 11),
+                color: deltaColor(value: perHour)
+            )
         default:
             return NSView()
         }
@@ -330,9 +351,11 @@ private final class OutlineProxy: NSObject, NSOutlineViewDataSource, NSOutlineVi
         controller?.isItemExpandable(item) ?? false
     }
 
-    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?,
-                     item: Any) -> NSView?
-    {
+    func outlineView(
+        _ outlineView: NSOutlineView,
+        viewFor tableColumn: NSTableColumn?,
+        item: Any
+    ) -> NSView? {
         guard let id = tableColumn?.identifier else { return nil }
         return controller?.viewFor(column: id, item: item)
     }

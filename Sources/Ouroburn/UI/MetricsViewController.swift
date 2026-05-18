@@ -83,12 +83,22 @@ final class MetricsViewController: NSViewController {
     }
 
     enum ConnectionState: Equatable {
+        /// No usable token anywhere (PKCE store, keychain, env). Click to sign in.
         case disconnected
+        /// PKCE login flow in progress.
         case authorizing
+        /// Token present, last fetch succeeded — optionally carries MTD spend.
         case connected(spendUSD: Double?)
+        /// Token present but last fetch failed transiently (network, 5xx, rate-limit). Solid red,
+        /// no blink — caller can still click to trigger sign-in if they want to swap accounts.
+        case failingTransient(reason: String)
+        /// Token present but rejected (401/403/404). Blinks red so the user notices the token is
+        /// invalid and needs to be replaced.
+        case authInvalid(reason: String)
     }
 
     private var connectionState: ConnectionState = .disconnected
+    private static let blinkAnimationKey = "ouroburn.connection.blink"
 
     func setConnectionState(_ state: ConnectionState) {
         connectionState = state
@@ -100,6 +110,7 @@ final class MetricsViewController: NSViewController {
         let color: NSColor
         let enabled: Bool
         let tooltip: String
+        var blink = false
         switch connectionState {
         case .disconnected:
             symbolName = "xmark.circle.fill"
@@ -117,6 +128,17 @@ final class MetricsViewController: NSViewController {
             enabled = true
             tooltip = spendUSD.map { String(format: "Connected · $%.2f MTD — click to sign out", $0) }
                 ?? "Connected · fetching MTD"
+        case let .failingTransient(reason):
+            symbolName = "exclamationmark.circle.fill"
+            color = Theme.accentRed
+            enabled = true
+            tooltip = "Fetch failing: \(reason)"
+        case let .authInvalid(reason):
+            symbolName = "exclamationmark.octagon.fill"
+            color = Theme.accentRed
+            enabled = true
+            tooltip = "Token rejected: \(reason) — click to sign in again"
+            blink = true
         }
         connectionButton.title = ""
         connectionButton.image = NSImage(
@@ -128,6 +150,25 @@ final class MetricsViewController: NSViewController {
         connectionButton.toolTip = tooltip
         if let layer = connectionButton.layer {
             Theme.applyGhostRim(layer, color: color, rimAlpha: 0.32, glowRadius: 10, glowAlpha: 0.45)
+        }
+        applyBlinkAnimation(enabled: blink)
+    }
+
+    private func applyBlinkAnimation(enabled: Bool) {
+        guard let layer = connectionButton.layer else { return }
+        if enabled {
+            guard layer.animation(forKey: Self.blinkAnimationKey) == nil else { return }
+            let blink = CABasicAnimation(keyPath: "opacity")
+            blink.fromValue = 1.0
+            blink.toValue = 0.25
+            blink.duration = 0.55
+            blink.autoreverses = true
+            blink.repeatCount = .infinity
+            blink.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(blink, forKey: Self.blinkAnimationKey)
+        } else {
+            layer.removeAnimation(forKey: Self.blinkAnimationKey)
+            layer.opacity = 1.0
         }
     }
 
@@ -271,13 +312,60 @@ final class MetricsViewController: NSViewController {
             )
         }
 
-        // Connection button doubles as the spend label. Stays red when disconnected, flips to
-        // mint with the dollar value once OAuth produces a number.
-        let isStoredCredentialPresent = OAuthCredentialStore.load() != nil
-        if !isStoredCredentialPresent, connectionState != .authorizing {
-            setConnectionState(.disconnected)
-        } else if isStoredCredentialPresent, connectionState != .authorizing {
+        // Connection state derivation order:
+        // 1. Mid-PKCE-flow always wins — never overwrite the spinner.
+        // 2. If the last billing fetch produced a structured health, that's authoritative.
+        // 3. Otherwise fall back to "do we have any token at all" (PKCE store, keychain, or env).
+        guard connectionState != .authorizing else { return }
+        let hasAnyToken = anyBillingTokenAvailable()
+        if let health = lastBillingHealth {
+            setConnectionState(connectionState(for: health, spendUSD: snapshot.billedMonthUSD))
+        } else if hasAnyToken {
             setConnectionState(.connected(spendUSD: snapshot.billedMonthUSD))
+        } else {
+            setConnectionState(.disconnected)
+        }
+    }
+
+    /// True when any of the billing backends has a usable token: PKCE store, keychain entry, or
+    /// environment variable. The previous logic only looked at the PKCE store, so a manually
+    /// pasted CLAUDE_OAUTH_TOKEN never lit the indicator green.
+    private func anyBillingTokenAvailable() -> Bool {
+        if OAuthCredentialStore.load() != nil { return true }
+        let env = ProcessInfo.processInfo.environment
+        if env["CLAUDE_OAUTH_TOKEN"]?.isEmpty == false { return true }
+        if env["ANTHROPIC_ADMIN_API_KEY"]?.isEmpty == false { return true }
+        if let v = Keychain.read(account: SecretsAccount.claudeOAuth), !v.isEmpty { return true }
+        if let v = Keychain.read(account: SecretsAccount.anthropicAdmin), !v.isEmpty { return true }
+        return false
+    }
+
+    private var lastBillingHealth: BillingHealth?
+
+    /// Latest structured health from the billing service. Called on the main thread (forwarded
+    /// from `StatusBarController.applyBillingHealth`).
+    func applyBillingHealth(_ health: BillingHealth) {
+        lastBillingHealth = health
+        guard connectionState != .authorizing else { return }
+        let spend = snapshot?.billedMonthUSD
+        setConnectionState(connectionState(for: health, spendUSD: spend))
+    }
+
+    private func connectionState(for health: BillingHealth, spendUSD: Double?) -> ConnectionState {
+        switch health {
+        case .unknown:
+            return anyBillingTokenAvailable() ? .connected(spendUSD: spendUSD) : .disconnected
+        case .tokenMissing:
+            return .disconnected
+        case .ok:
+            return .connected(spendUSD: spendUSD)
+        case let .authInvalid(code):
+            return .authInvalid(reason: "HTTP \(code)")
+        case let .rateLimited(retryAfterSeconds):
+            let mins = Int(max(retryAfterSeconds / 60, 1))
+            return .failingTransient(reason: "rate-limited (\(mins)m)")
+        case let .transient(reason):
+            return .failingTransient(reason: reason)
         }
     }
 
@@ -866,7 +954,9 @@ final class StatTile: NSView {
         fatalError("not used")
     }
 
-    @objc private func handleClick() { onClick?() }
+    @objc private func handleClick() {
+        onClick?()
+    }
 
     func update(tokens tokenCount: Int, costUSD: Double, accent: NSColor, placeholder: Bool = false) {
         if placeholder {
@@ -1215,9 +1305,12 @@ private final class TopSessionsView: NSView {
     private let titleLabel = NSTextField(labelWithString: "Top sessions")
     private let countLabel = NSTextField(labelWithString: "")
     private let stack = NSStackView()
-    private let emptyLabel = NSTextField(labelWithString: "No active sessions in this view yet.")
+    private let emptyLabel = NSTextField(labelWithString: "No recent session activity.")
 
     private static let rowCap = 5
+    /// Sessions whose last activity is older than this fall out of the live view. Keeps the panel
+    /// from surfacing week-old sessions when the user just opened the popover for a quick glance.
+    private static let recentActivityWindow: TimeInterval = 30 * 60
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1314,14 +1407,22 @@ private final class TopSessionsView: NSView {
             let session: String
             var velocity: SessionVelocity?
         }
+        let cutoff = Date().addingTimeInterval(-Self.recentActivityWindow)
         let items: [Item] = buckets.compactMap { bucket in
             guard let split = ProjectPath.splitSessionBucketID(bucket.id) else { return nil }
             let key = "\(split.project)/\(split.session)"
+            let velocity = liveBySession?[key]
+            // Keep sessions with live activity (any velocity row) OR a bucket that closed inside
+            // the recent window. Drops anything older — the panel is a live signal, not a session
+            // history view, so a week-old session with no live tail-reads must not surface here.
+            let hasLive = (velocity?.tokensPerMinute ?? 0) > 0
+            let recent = (bucket.end ?? .distantPast) >= cutoff
+            guard hasLive || recent else { return nil }
             return Item(
                 bucket: bucket,
                 segments: ProjectPath.segments(split.project),
                 session: split.session,
-                velocity: liveBySession?[key]
+                velocity: velocity
             )
         }
         guard !items.isEmpty else {
@@ -1332,18 +1433,28 @@ private final class TopSessionsView: NSView {
         emptyLabel.isHidden = true
 
         let prefix = ProjectPath.commonPrefixLeavingTail(items.map(\.segments))
-        let ranked: [Item]
-        if liveBySession != nil {
-            // Sort by live tokens/min desc; sessions with zero live activity sink to the bottom
-            // but keep their original cost-desc ordering relative to each other.
-            ranked = items.sorted { lhs, rhs in
+        let ranked: [Item] = if liveBySession != nil {
+            // Live mode: tokens/min desc first, then most-recent activity, then cost as final
+            // tiebreaker. Sessions with zero live velocity but recent bucket activity still rank
+            // by recency so the panel reads as "what's happening now".
+            items.sorted { lhs, rhs in
                 let l = lhs.velocity?.tokensPerMinute ?? 0
                 let r = rhs.velocity?.tokensPerMinute ?? 0
                 if l != r { return l > r }
+                let le = lhs.bucket.end ?? .distantPast
+                let re = rhs.bucket.end ?? .distantPast
+                if le != re { return le > re }
                 return lhs.bucket.costUSD > rhs.bucket.costUSD
             }
         } else {
-            ranked = items.sorted { $0.bucket.costUSD > $1.bucket.costUSD }
+            // No live snapshot yet (popover just opened): rank by recency so the top row is the
+            // session that most recently wrote a transcript entry.
+            items.sorted { lhs, rhs in
+                let le = lhs.bucket.end ?? .distantPast
+                let re = rhs.bucket.end ?? .distantPast
+                if le != re { return le > re }
+                return lhs.bucket.costUSD > rhs.bucket.costUSD
+            }
         }
 
         let visible = Array(ranked.prefix(Self.rowCap))
@@ -1417,7 +1528,7 @@ private final class TopSessionsRow: NSView {
         // When a live tokens/min figure is available, prefer it over the static bucket total —
         // that's the whole point of the live tick: surface what's happening right now, not the
         // session's lifetime aggregate.
-        let tokensText: String = if let tpm = liveTokensPerMinute, tpm > 0 {
+        let tokensText = if let tpm = liveTokensPerMinute, tpm > 0 {
             "\(BurnFormatting.compactTokens(Int(tpm)))/m"
         } else {
             "\(BurnFormatting.compactTokens(tokens)) TK"
@@ -1427,7 +1538,7 @@ private final class TopSessionsRow: NSView {
         tokensField.textColor = Theme.textSecondary
         tokensField.translatesAutoresizingMaskIntoConstraints = false
 
-        let costText: String = if let cph = liveCostPerHour, cph > 0 {
+        let costText = if let cph = liveCostPerHour, cph > 0 {
             String(format: "$%.2f/hr", cph)
         } else {
             String(format: "$%.2f", cost)
@@ -1548,7 +1659,9 @@ private final class ProjectGroupRowView: NSView {
         fatalError("not used")
     }
 
-    @objc private func handleClick() { onToggle?(key) }
+    @objc private func handleClick() {
+        onToggle?(key)
+    }
 
     private func configure() {
         let primary: NSColor = anyActive ? Theme.accentMint : Theme.textPrimary

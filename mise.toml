@@ -8,24 +8,96 @@ swiftlint = "0.61"
 
 [env]
 _.path = [".build/release"]
+OUROBURN_BUNDLE_ID = "dev.sheldonhull.ouroburn"
+OUROBURN_DISPLAY_NAME = "ouroburn"
+OUROBURN_VERSION = "0.1.0"
+OUROBURN_CERT_NAME = "Ouroburn Dev Signing"
+OUROBURN_INSTALL_PATH = "/Applications/Ouroburn.app"
 
 [tasks.build]
 description = "Release build"
 run = "swift build -c release"
 
-[tasks.run]
-description = "Run as a proper .app bundle (UNUserNotificationCenter needs CFBundleIdentifier)"
+[tasks."app:bundle"]
+description = "Build SwiftPM binary into a proper .app bundle (BUILD_CONFIG=debug|release, default release)"
 run = """
-./scripts/bundle-app.sh debug
-launchctl asuser "$(id -u)" open .build/Ouroburn.app
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$(uname -s)" == "Darwin" ]] || { echo app:bundle macOS-only - skipping; exit 0; }
+
+BUILD_CONFIG="${BUILD_CONFIG:-release}"
+ROOT="$(pwd)"
+BIN_DIR="$ROOT/.build/$BUILD_CONFIG"
+APP_DIR="$ROOT/.artifacts/Ouroburn.app"
+
+# SwiftPM produces a loose Mach-O; AppKit + UserNotifications need a CFBundleIdentifier
+# so we wrap it into a real .app. Always rebuild — relying on the binary's mtime missed
+# source changes when the release build cache was older than the debug one.
+if [[ "$BUILD_CONFIG" == "release" ]]; then
+    swift build -c release
+else
+    swift build
+fi
+
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+cp "$BIN_DIR/ouroburn" "$APP_DIR/Contents/MacOS/ouroburn"
+
+cat >"$APP_DIR/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>      <string>en</string>
+    <key>CFBundleExecutable</key>             <string>ouroburn</string>
+    <key>CFBundleIdentifier</key>             <string>${OUROBURN_BUNDLE_ID}</string>
+    <key>CFBundleInfoDictionaryVersion</key>  <string>6.0</string>
+    <key>CFBundleName</key>                   <string>${OUROBURN_DISPLAY_NAME}</string>
+    <key>CFBundleDisplayName</key>            <string>ouroburn</string>
+    <key>CFBundlePackageType</key>            <string>APPL</string>
+    <key>CFBundleShortVersionString</key>     <string>${OUROBURN_VERSION}</string>
+    <key>CFBundleVersion</key>                <string>${OUROBURN_VERSION}</string>
+    <key>LSMinimumSystemVersion</key>         <string>14.0</string>
+    <key>LSUIElement</key>                    <true/>
+    <key>NSHighResolutionCapable</key>        <true/>
+    <key>NSPrincipalClass</key>               <string>NSApplication</string>
+    <key>NSUserNotificationAlertStyle</key>   <string>banner</string>
+</dict>
+</plist>
+PLIST
+
+# Sign with stable dev cert when present so the designated requirement is pinned to
+# the cert leaf instead of cdhash; that lets TCC grants survive cdhash drift across
+# rebuilds. Run `mise run cert:create` once to populate the keychain. Falls back to
+# adhoc sign so first-time users (and CI) still get a launchable bundle.
+if security find-certificate -c "${OUROBURN_CERT_NAME}" >/dev/null 2>&1; then
+    codesign --force --deep --sign "${OUROBURN_CERT_NAME}" --timestamp=none "$APP_DIR" >/dev/null
+    SIGN_MODE="cert: ${OUROBURN_CERT_NAME}"
+else
+    codesign --force --deep --sign - "$APP_DIR" >/dev/null
+    SIGN_MODE="adhoc (run 'mise run cert:create' to stop TCC re-prompts)"
+fi
+
+# Strip quarantine so Gatekeeper doesn't first-launch-prompt on a freshly built bundle.
+xattr -cr "$APP_DIR" 2>/dev/null || true
+
+echo "Built $APP_DIR"
+echo "  signed: $SIGN_MODE"
+"""
+
+[tasks.run]
+description = "Build debug bundle and launch it"
+run = """
+BUILD_CONFIG=debug mise run app:bundle
+launchctl asuser "$(id -u)" open .artifacts/Ouroburn.app
 """
 
 [tasks.relaunch]
 description = "Kill any running Ouroburn, rebuild the debug bundle, relaunch"
 run = """
 pkill -f 'Ouroburn.app/Contents/MacOS/ouroburn' 2>/dev/null || true
-./scripts/bundle-app.sh debug
-launchctl asuser "$(id -u)" open .build/Ouroburn.app
+BUILD_CONFIG=debug mise run app:bundle
+launchctl asuser "$(id -u)" open .artifacts/Ouroburn.app
 """
 
 [tasks.run-loose]
@@ -34,7 +106,52 @@ run = "swift run ouroburn"
 
 [tasks.bundle]
 description = "Build release .app bundle"
-run = "./scripts/bundle-app.sh release"
+run = "BUILD_CONFIG=release mise run app:bundle"
+
+[tasks.deploy]
+description = "Build, sign, and install Ouroburn.app to OUROBURN_INSTALL_PATH (default /Applications/Ouroburn.app)"
+depends = ["bundle"]
+run_windows = "echo deploy is macOS-only - skipping"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$(uname -s)" == "Darwin" ]] || { echo deploy macOS-only - skipping; exit 0; }
+
+SRC=".artifacts/Ouroburn.app"
+DEST="${OUROBURN_INSTALL_PATH}"
+
+[[ -d "$SRC" ]] || { echo "Bundle not found at $SRC - bundle task didn't produce one" >&2; exit 1; }
+
+echo "-> stopping any running Ouroburn"
+pkill -f 'Ouroburn.app/Contents/MacOS/ouroburn' 2>/dev/null || true
+
+echo "-> installing $SRC -> $DEST"
+if [[ -d "$DEST" ]]; then
+    rm -rf "$DEST" 2>/dev/null || sudo rm -rf "$DEST"
+fi
+# cp -R preserves the codesign blob; mv across volumes would break it.
+if ! cp -R "$SRC" "$DEST" 2>/dev/null; then
+    echo "   (needs sudo for $DEST)"
+    sudo cp -R "$SRC" "$DEST"
+fi
+
+# Strip quarantine on the installed copy too - Gatekeeper would otherwise re-prompt
+# after the cp because the install destination inherits no xattr cleanup.
+xattr -cr "$DEST" 2>/dev/null || sudo xattr -cr "$DEST" 2>/dev/null || true
+
+echo "-> verifying signature on installed bundle"
+codesign --verify --deep --strict --verbose=2 "$DEST" 2>&1 | tail -3 || true
+
+echo "OK installed: $DEST"
+echo "   Launch with: open '$DEST'"
+"""
+
+[tasks."deploy:run"]
+description = "Deploy to /Applications then launch"
+depends = ["deploy"]
+run = """
+open "${OUROBURN_INSTALL_PATH}"
+"""
 
 [tasks.test]
 description = "Run tests (swift-testing; XCTest unavailable without Xcode)"
@@ -61,8 +178,8 @@ description = "Lint + build"
 depends = ["lint", "build"]
 
 [tasks.clean]
-description = "Clean build artifacts"
-run = "swift package clean && rm -rf .build"
+description = "Clean build artifacts (preserves .cache/ long-lived assets)"
+run = "swift package clean && rm -rf .build .artifacts"
 
 # --- macOS code-signing (stop TCC re-prompts on rebuild) -----------------------
 # Self-signed cert in login keychain. Designated requirement pins to cert leaf
@@ -70,22 +187,21 @@ run = "swift package clean && rm -rf .build"
 # survive every rebuild. See: https://docs.anthropic.com (skill: macos-stable-codesign)
 
 [tasks."cert:create"]
-description = "One-time: create 'Ouroburn Dev Signing' cert in login keychain"
+description = "One-time: create OUROBURN_CERT_NAME cert in login keychain"
 run_windows = "echo cert:create is macOS-only - skipping"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "$(uname -s)" == "Darwin" ]] || { echo cert:create macOS-only - skipping; exit 0; }
 
-CERT_NAME="Ouroburn Dev Signing"
 LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
-if security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
-    echo "OK cert '$CERT_NAME' already in login keychain"
+if security find-certificate -c "${OUROBURN_CERT_NAME}" >/dev/null 2>&1; then
+    echo "OK cert '${OUROBURN_CERT_NAME}' already in login keychain"
     exit 0
 fi
 
-echo "-> creating self-signed code-signing cert: $CERT_NAME"
+echo "-> creating self-signed code-signing cert: ${OUROBURN_CERT_NAME}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -95,7 +211,7 @@ prompt             = no
 distinguished_name = dn
 x509_extensions    = v3_req
 [dn]
-CN = $CERT_NAME
+CN = ${OUROBURN_CERT_NAME}
 [v3_req]
 keyUsage             = critical, digitalSignature
 extendedKeyUsage     = critical, codeSigning
@@ -117,7 +233,7 @@ echo "OK cert added. First codesign run pops ONE keychain dialog -> click 'Alway
 """
 
 [tasks."app:sign"]
-description = "Re-sign existing .build/Ouroburn.app with stable dev cert; verify DR is leaf-pinned"
+description = "Re-sign existing .artifacts/Ouroburn.app with stable dev cert; verify DR is leaf-pinned"
 depends = ["cert:create"]
 run_windows = "echo app:sign is macOS-only - skipping"
 run = """
@@ -125,12 +241,11 @@ run = """
 set -euo pipefail
 [[ "$(uname -s)" == "Darwin" ]] || { echo app:sign macOS-only - skipping; exit 0; }
 
-CERT_NAME="Ouroburn Dev Signing"
-APP="${APP:-.build/Ouroburn.app}"
+APP="${APP:-.artifacts/Ouroburn.app}"
 
 [[ -d "$APP" ]] || { echo "Bundle not found at $APP - run 'mise run run' first" >&2; exit 1; }
 
-codesign --force --deep --sign "$CERT_NAME" --timestamp=none "$APP"
+codesign --force --deep --sign "${OUROBURN_CERT_NAME}" --timestamp=none "$APP"
 
 DR=$(codesign -d -r- "$APP" 2>&1 | grep designated || echo "no DR")
 echo "OK signed: $APP"
@@ -150,7 +265,7 @@ run = """
 set -euo pipefail
 [[ "$(uname -s)" == "Darwin" ]] || { echo app:diag macOS-only - skipping; exit 0; }
 
-APP="${APP:-.build/Ouroburn.app}"
+APP="${APP:-.artifacts/Ouroburn.app}"
 [[ -d "$APP" ]] || { echo "App not found at $APP" >&2; exit 1; }
 
 echo "=== $APP ==="
@@ -171,12 +286,11 @@ run = """
 set -euo pipefail
 [[ "$(uname -s)" == "Darwin" ]] || { echo reset-permissions macOS-only; exit 0; }
 
-BUNDLE_ID="${BUNDLE_ID:-dev.sheldonhull.ouroburn}"
-echo "-> resetting TCC grants for $BUNDLE_ID"
-tccutil reset Accessibility        "$BUNDLE_ID" 2>/dev/null || true
-tccutil reset ScreenCapture        "$BUNDLE_ID" 2>/dev/null || true
-tccutil reset AppleEvents          "$BUNDLE_ID" 2>/dev/null || true
-tccutil reset SystemPolicyAllFiles "$BUNDLE_ID" 2>/dev/null || true
-pkill -f "$BUNDLE_ID" 2>/dev/null || true
+echo "-> resetting TCC grants for ${OUROBURN_BUNDLE_ID}"
+tccutil reset Accessibility        "${OUROBURN_BUNDLE_ID}" 2>/dev/null || true
+tccutil reset ScreenCapture        "${OUROBURN_BUNDLE_ID}" 2>/dev/null || true
+tccutil reset AppleEvents          "${OUROBURN_BUNDLE_ID}" 2>/dev/null || true
+tccutil reset SystemPolicyAllFiles "${OUROBURN_BUNDLE_ID}" 2>/dev/null || true
+pkill -f "${OUROBURN_BUNDLE_ID}" 2>/dev/null || true
 echo "OK done. Next launch will re-prompt."
 """

@@ -17,8 +17,11 @@ DerivedData/
 .mise.local.toml
 .hk/
 
-# Local cache (ccusage clone for reference)
+# Local cache (ccusage clone for reference, long-lived assets/certs)
 .cache/
+
+# Build artifacts (signed .app bundles, deploy intermediates)
+.artifacts/
 
 # Logs
 *.log

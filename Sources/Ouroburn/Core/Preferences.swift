@@ -15,7 +15,11 @@ struct Preferences: Sendable {
     var toastEnabled: Bool
     var toastCostThresholdUSDPerHour: Double
     var toastSustainedSeconds: Double
-    var toastDurationSeconds: Double
+    /// Toast on every newly-observed peak in today's per-interval OAuth spend delta. Fires
+    /// independent of `toastEnabled` so users can run pure peak alerting without a $/hr floor.
+    var toastPeakAlertEnabled: Bool
+    /// Launch the menu-bar app on macOS login via SMAppService.
+    var launchAtLoginEnabled: Bool
     static let oauthRefreshMaxMinutes: Double = 15
 
     static let `default` = Preferences(
@@ -27,7 +31,8 @@ struct Preferences: Sendable {
         toastEnabled: false,
         toastCostThresholdUSDPerHour: 8,
         toastSustainedSeconds: 30,
-        toastDurationSeconds: 6
+        toastPeakAlertEnabled: true,
+        launchAtLoginEnabled: false
     )
 }
 
@@ -43,7 +48,8 @@ enum PreferencesStore {
         static let toastEnabled = "ouroburn.toastEnabled"
         static let toastThreshold = "ouroburn.toastCostThresholdUSDPerHour"
         static let toastSustained = "ouroburn.toastSustainedSeconds"
-        static let toastDuration = "ouroburn.toastDurationSeconds"
+        static let toastPeakAlertEnabled = "ouroburn.toastPeakAlertEnabled"
+        static let launchAtLoginEnabled = "ouroburn.launchAtLoginEnabled"
     }
 
     static func load() -> Preferences {
@@ -74,8 +80,11 @@ enum PreferencesStore {
         if defaults.object(forKey: Key.toastSustained) != nil {
             prefs.toastSustainedSeconds = defaults.double(forKey: Key.toastSustained)
         }
-        if defaults.object(forKey: Key.toastDuration) != nil {
-            prefs.toastDurationSeconds = defaults.double(forKey: Key.toastDuration)
+        if defaults.object(forKey: Key.toastPeakAlertEnabled) != nil {
+            prefs.toastPeakAlertEnabled = defaults.bool(forKey: Key.toastPeakAlertEnabled)
+        }
+        if defaults.object(forKey: Key.launchAtLoginEnabled) != nil {
+            prefs.launchAtLoginEnabled = defaults.bool(forKey: Key.launchAtLoginEnabled)
         }
         return prefs
     }
@@ -89,7 +98,8 @@ enum PreferencesStore {
         defaults.set(prefs.toastEnabled, forKey: Key.toastEnabled)
         defaults.set(prefs.toastCostThresholdUSDPerHour, forKey: Key.toastThreshold)
         defaults.set(prefs.toastSustainedSeconds, forKey: Key.toastSustained)
-        defaults.set(prefs.toastDurationSeconds, forKey: Key.toastDuration)
+        defaults.set(prefs.toastPeakAlertEnabled, forKey: Key.toastPeakAlertEnabled)
+        defaults.set(prefs.launchAtLoginEnabled, forKey: Key.launchAtLoginEnabled)
     }
 }
 

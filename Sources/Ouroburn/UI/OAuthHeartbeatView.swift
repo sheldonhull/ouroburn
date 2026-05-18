@@ -28,7 +28,9 @@ final class OAuthHeartbeatView: NSView {
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     func update(samples raw: [BillingSample]) {
         let sorted = raw.sorted { $0.timestamp < $1.timestamp }
@@ -36,13 +38,12 @@ final class OAuthHeartbeatView: NSView {
         let dayStart = calendar.startOfDay(for: Date())
         // Keep one pre-midnight anchor so the first today-delta has a real baseline.
         let firstTodayIdx = sorted.firstIndex { $0.timestamp >= dayStart }
-        let scoped: [BillingSample]
-        if let firstTodayIdx, firstTodayIdx > 0 {
-            scoped = Array(sorted[(firstTodayIdx - 1)...])
+        let scoped: [BillingSample] = if let firstTodayIdx, firstTodayIdx > 0 {
+            Array(sorted[(firstTodayIdx - 1)...])
         } else if let firstTodayIdx {
-            scoped = Array(sorted[firstTodayIdx...])
+            Array(sorted[firstTodayIdx...])
         } else {
-            scoped = []
+            []
         }
         samples = scoped
         beats = Self.computeBeats(samples: samples, todayStart: dayStart)
@@ -64,11 +65,10 @@ final class OAuthHeartbeatView: NSView {
         var beats: [Beat] = []
         beats.reserveCapacity(raw.count)
         for (i, point) in raw.enumerated() {
-            let smoothed: Double
-            if i == 0 || i == raw.count - 1 {
-                smoothed = point.1
+            let smoothed: Double = if i == 0 || i == raw.count - 1 {
+                point.1
             } else {
-                smoothed = (raw[i - 1].1 + point.1 + raw[i + 1].1) / 3
+                (raw[i - 1].1 + point.1 + raw[i + 1].1) / 3
             }
             beats.append(Beat(timestamp: point.0, dollars: point.1, smoothed: smoothed, mtd: point.2))
         }
@@ -128,7 +128,9 @@ private final class HeartbeatCanvas: NSView {
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     func update(beats next: [OAuthHeartbeatView.Beat]) {
         beats = next
@@ -281,7 +283,9 @@ private final class HeartbeatCanvas: NSView {
         guard let first = points.first else { return path }
         path.move(to: first)
         if points.count < 3 {
-            for p in points.dropFirst() { path.addLine(to: p) }
+            for p in points.dropFirst() {
+                path.addLine(to: p)
+            }
             return path
         }
         for i in 0 ..< points.count - 1 {
@@ -391,7 +395,9 @@ private final class HeartbeatTooltip: NSView {
     }
 
     @available(*, unavailable)
-    required init?(coder _: NSCoder) { fatalError("not used") }
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
 
     func update(beat: OAuthHeartbeatView.Beat, accent: NSColor) {
         let formatter = DateFormatter()
