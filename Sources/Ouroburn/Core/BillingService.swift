@@ -30,9 +30,12 @@ import Foundation
 /// Pulls run at most once per hour (in-memory throttle) and cache to disk so the popover has
 /// data to show after relaunch even when offline.
 actor BillingService {
-    /// Cap on the exponential-backoff cool-down — `Preferences.oauthRefreshMaxMinutes` mirrors
-    /// this so the settings UI uses the same ceiling.
-    private static let backoffCeilingSeconds: TimeInterval = 15 * 60
+    /// Cap on automatic exponential-backoff poll cadence. `Preferences.oauthRefreshMaxMinutes`
+    /// mirrors this baseline so the settings UI uses the same ceiling.
+    private static let pollIntervalCeilingSeconds: TimeInterval = 15 * 60
+    /// Hard cap when honoring a server-issued `Retry-After`. Upstream sends 30-60 min penalty
+    /// windows; clamping to 15 min would retry into an active 429 and bump the penalty.
+    private static let cooldownCeilingSeconds: TimeInterval = 90 * 60
     private static let httpTimeout: TimeInterval = 15
     private static let oauthUsageEndpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     private static let oauthUsageBeta = "oauth-2025-04-20"
@@ -60,11 +63,7 @@ actor BillingService {
     private var consecutiveFailures: Int = 0 // doubles the cool-down each time, capped at the ceiling
     private var lastStatusMessage: String? // human-readable billing status surfaced into the snapshot
     private var lastHealth: BillingHealth = .unknown
-    /// While the popover is open we shorten the floor so the user's monthly tile keeps up. Still
-    /// rides on top of `consecutiveFailures` backoff and the upstream 429 cool-down — this only
-    /// changes the *baseline*, not the cooldown semantics.
-    private var foregroundFloorSeconds: TimeInterval?
-    static let foregroundBoostSeconds: TimeInterval = 60
+    private let probeStateURL: URL
 
     init(
         cacheURL: URL,
@@ -76,6 +75,7 @@ actor BillingService {
         self.session = session
         self.environment = environment
         self.sampleStore = sampleStore
+        probeStateURL = cacheURL.deletingLastPathComponent().appendingPathComponent("oauth-state.json")
         let initial = Self.readDiskCacheStatic(at: cacheURL)
         lastReport = initial
         lastFetchedAt = initial?.fetchedAt
@@ -83,6 +83,14 @@ actor BillingService {
         // backend (e.g. enterprise probe) and we want the new poll cadence to fire on the next
         // tick rather than waiting out the 1-hour throttle from the previous run.
         lastAttemptAt = nil
+        if let probe = Self.readProbeStateStatic(at: probeStateURL),
+           let until = probe.backoffUntil, until > Date()
+        {
+            oauthBackoffUntil = until
+            lastHealth = probe.lastHealth
+            lastStatusMessage = probe.lastStatusMessage
+            consecutiveFailures = probe.consecutiveFailures
+        }
     }
 
     /// Returns the latest billed/used total. Throttled to **at most one network attempt per
@@ -97,17 +105,10 @@ actor BillingService {
     /// 3. Otherwise the backend is skipped.
     /// Update the baseline poll interval at runtime when the user edits the setting. Bounded to
     /// `[1, 60]` minutes; the exponential backoff still rides on top up to
-    /// `backoffCeilingSeconds`.
+    /// `pollIntervalCeilingSeconds`.
     func setPollInterval(minutes: Double) {
         let clamped = min(max(minutes, 1), 60)
         baselinePollInterval = clamped * 60
-    }
-
-    /// Toggle the foreground boost on/off. While `active`, the effective baseline floors at
-    /// `foregroundBoostSeconds` (60s) — the user's configured interval still wins if it's already
-    /// shorter. Backoff and 429 cool-downs are unchanged.
-    func setForegroundActive(_ active: Bool) {
-        foregroundFloorSeconds = active ? Self.foregroundBoostSeconds : nil
     }
 
     func currentMonthBilledUSD() async -> Double? {
@@ -152,16 +153,9 @@ actor BillingService {
 
     /// Effective interval = baseline × 2^failures, capped at the ceiling. After a successful
     /// fetch the failure count resets and we drop back to the user's configured cadence.
-    /// While the foreground boost is active, the baseline is replaced by the smaller of the two
-    /// (so a user who already runs 30s polls isn't slowed down by the boost).
     private func currentPollInterval() -> TimeInterval {
-        let baseline: TimeInterval = if let floor = foregroundFloorSeconds {
-            min(baselinePollInterval, floor)
-        } else {
-            baselinePollInterval
-        }
         let multiplier = pow(2.0, Double(consecutiveFailures))
-        return min(baseline * multiplier, Self.backoffCeilingSeconds)
+        return min(baselinePollInterval * multiplier, Self.pollIntervalCeilingSeconds)
     }
 
     private func registerSuccess() {
@@ -171,7 +165,7 @@ actor BillingService {
 
     private func registerFailure() {
         // Cap the exponent so multiplier doesn't overflow; the ceiling clamps the actual delay.
-        if currentPollInterval() < Self.backoffCeilingSeconds {
+        if currentPollInterval() < Self.pollIntervalCeilingSeconds {
             consecutiveFailures += 1
         }
         // Preserve any specific health classification set by the backend (auth, rateLimited).
@@ -260,6 +254,9 @@ actor BillingService {
         lastAttemptAt = nil
         oauthBackoffUntil = nil
         consecutiveFailures = 0
+        lastHealth = .unknown
+        lastStatusMessage = nil
+        try? FileManager.default.removeItem(at: probeStateURL)
     }
 
     /// Last human-readable billing status (success summary, 429 backoff timer, auth failure
@@ -309,6 +306,7 @@ actor BillingService {
                 result.fiveHourPct * 100, result.sevenDayPct * 100
             ))
             lastStatusMessage = nil // success — let the dollar value speak for itself
+            writeProbeState()
             return BillingReport(
                 month: BillingReport.currentMonthKey(),
                 totalUSD: result.extraUsedUSD,
@@ -323,12 +321,10 @@ actor BillingService {
         } catch let error as OAuthUsageError {
             switch error {
             case let .rateLimited(retryAfter):
-                // Honour the upstream Retry-After but never accept a value above the global
-                // ceiling — the public-tracker issues #31021/#31637 show 429s frequently miss
-                // Retry-After entirely, and we don't want a misbehaving server to lock us out
-                // for hours. Falls back to the current backed-off interval when absent.
+                // Honour the upstream Retry-After up to the cooldown ceiling — upstream sends
+                // 30-60 min penalty windows and the old 15-min cap retried into them.
                 let fallback = currentPollInterval()
-                let cooldown = min(max(retryAfter, fallback), Self.backoffCeilingSeconds)
+                let cooldown = min(max(retryAfter, fallback), Self.cooldownCeilingSeconds)
                 let until = Date().addingTimeInterval(cooldown)
                 oauthBackoffUntil = until
                 Log.error(
@@ -337,6 +333,7 @@ actor BillingService {
                 )
                 lastStatusMessage = "rate-limited · retry in \(formatMinutes(cooldown))"
                 lastHealth = .rateLimited(retryAfterSeconds: cooldown)
+                writeProbeState()
             case let .badStatus(code):
                 Log.error(Log.pricing, "OAuth usage status \(code)")
                 if code == 401 || code == 403 || code == 404 {
@@ -346,20 +343,24 @@ actor BillingService {
                     lastStatusMessage = "/api/oauth/usage HTTP \(code)"
                     lastHealth = .transient(reason: "HTTP \(code)")
                 }
+                writeProbeState()
             case let .transport(message):
                 Log.error(Log.pricing, "OAuth usage transport error: \(message)")
                 lastStatusMessage = "network error · \(message)"
                 lastHealth = .transient(reason: message)
+                writeProbeState()
             case .decodeFailure:
                 Log.error(Log.pricing, "OAuth usage payload decode failed")
                 lastStatusMessage = "decode failed · upstream payload changed?"
                 lastHealth = .transient(reason: "decode failed")
+                writeProbeState()
             }
             return nil
         } catch {
             Log.error(Log.pricing, "OAuth usage fetch failed: \(error.localizedDescription)")
             lastStatusMessage = "fetch failed · \(error.localizedDescription)"
             lastHealth = .transient(reason: error.localizedDescription)
+            writeProbeState()
             return nil
         }
     }
@@ -401,8 +402,8 @@ actor BillingService {
         }
         guard let http = response as? HTTPURLResponse else { throw OAuthUsageError.badStatus(-1) }
         if http.statusCode == 429 {
-            let retryAfter = (http.value(forHTTPHeaderField: "Retry-After"))
-                .flatMap(TimeInterval.init) ?? currentPollInterval()
+            let retryAfter = Self.parseRetryAfter(http.value(forHTTPHeaderField: "Retry-After"))
+                ?? currentPollInterval()
             throw OAuthUsageError.rateLimited(retryAfter: retryAfter)
         }
         guard (200 ..< 300).contains(http.statusCode) else {
@@ -621,6 +622,46 @@ actor BillingService {
             try? data.write(to: cacheURL, options: .atomic)
         }
     }
+
+    static func readProbeStateStatic(at url: URL) -> OAuthProbeState? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(OAuthProbeState.self, from: data)
+    }
+
+    private func writeProbeState() {
+        try? FileManager.default.createDirectory(
+            at: probeStateURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let state = OAuthProbeState(
+            backoffUntil: oauthBackoffUntil,
+            lastHealth: lastHealth,
+            lastStatusMessage: lastStatusMessage,
+            consecutiveFailures: consecutiveFailures,
+            updatedAt: Date()
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(state) {
+            try? data.write(to: probeStateURL, options: .atomic)
+        }
+    }
+
+    static func parseRetryAfter(_ header: String?) -> TimeInterval? {
+        guard let raw = header?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+        if let seconds = TimeInterval(raw), seconds > 0 { return seconds }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        if let date = formatter.date(from: raw) {
+            let delta = date.timeIntervalSinceNow
+            return delta > 0 ? delta : nil
+        }
+        return nil
+    }
 }
 
 private struct EnterpriseOrg {
@@ -652,7 +693,7 @@ private struct EnterpriseOrg {
 
 /// Structured result of the most recent billing fetch. Lets the popover paint a meaningful
 /// indicator color without re-parsing `currentStatusMessage`.
-enum BillingHealth: Sendable, Equatable {
+enum BillingHealth: Sendable, Equatable, Codable {
     /// No fetch attempted yet (or first run with no cache).
     case unknown
     /// No usable token anywhere.
