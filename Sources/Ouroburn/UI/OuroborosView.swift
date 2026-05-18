@@ -4,17 +4,15 @@ import QuartzCore
 /// Animated ouroboros for the menu bar.
 ///
 /// Renders a coiled snake biting its tail using a tapered body (head fat, tail thin), an open
-/// mouth wedge, an eye, and a tail tip clamped in the mouth. A bold tier number (1-10) sits in
-/// the center to communicate burn intensity at a glance.
+/// mouth wedge, an eye, and a tail tip clamped in the mouth. Color + rotation speed encode the
+/// burn-rate tier (1...10).
 ///
 /// Architecture: snake is rasterized to a `CGImage` once per tier (color + size unchanged
 /// between ticks), then a single `CABasicAnimation` on `transform.rotation.z` spins the image
-/// layer — the GPU composites the rotation, so per-frame CPU is zero. Tier number sits in a
-/// sibling layer that does NOT inherit the rotation transform.
+/// layer — the GPU composites the rotation, so per-frame CPU is zero.
 @MainActor
 final class OuroborosView: NSView {
     private let snakeLayer = CALayer()
-    private let numberLayer = CATextLayer()
     private var currentTier: Int = -1
     private var currentImageSize: CGSize = .zero
 
@@ -43,20 +41,6 @@ final class OuroborosView: NSView {
         snakeLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
         layer?.addSublayer(snakeLayer)
 
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
-        numberLayer.contentsScale = scale
-        numberLayer.alignmentMode = .center
-        numberLayer.font = NSFont.boldSystemFont(ofSize: 10) as CTFont
-        numberLayer.fontSize = 10
-        numberLayer.foregroundColor = NSColor.white.cgColor
-        // Subtle dark shadow so the number stays legible against any tier color.
-        numberLayer.shadowColor = NSColor.black.cgColor
-        numberLayer.shadowOpacity = 0.85
-        numberLayer.shadowRadius = 1.5
-        numberLayer.shadowOffset = .zero
-        layoutNumberLayer()
-        layer?.addSublayer(numberLayer)
-
         applyTier(1)
     }
 
@@ -70,23 +54,12 @@ final class OuroborosView: NSView {
         layer?.frame = bounds
         snakeLayer.frame = bounds
         snakeLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
-        layoutNumberLayer()
         if bounds.size != currentImageSize {
             // Force a re-rasterize at the new size.
+            let tier = max(1, currentTier)
             currentTier = -1
-            applyTier(max(1, currentTier))
+            applyTier(tier)
         }
-    }
-
-    private func layoutNumberLayer() {
-        let font = NSFont.boldSystemFont(ofSize: 10)
-        let lineHeight = font.ascender - font.descender
-        numberLayer.frame = CGRect(
-            x: 0,
-            y: (bounds.height - lineHeight) / 2,
-            width: bounds.width,
-            height: lineHeight
-        )
     }
 
     /// Map `liveRate / medianRate` onto tiers 1...10. `liveRate <= medianRate` → tier 1.
@@ -117,8 +90,6 @@ final class OuroborosView: NSView {
         snakeLayer.contents = image
         layer?.shadowColor = color.cgColor
         layer?.shadowRadius = 3 + 5 * t
-        numberLayer.string = "\(tier)"
-        numberLayer.foregroundColor = contrastTextColor(forBackground: color).cgColor
         CATransaction.commit()
 
         installRotation(rps: rps)
@@ -141,16 +112,6 @@ final class OuroborosView: NSView {
             return lerp(idleColor, warmColor, t * 2)
         }
         return lerp(warmColor, hotColor, (t - 0.5) * 2)
-    }
-
-    private func contrastTextColor(forBackground color: NSColor) -> NSColor {
-        // Compute relative luminance (sRGB) and pick black on light backgrounds, white on dark.
-        let rgb = color.usingColorSpace(.sRGB) ?? color
-        let r = rgb.redComponent
-        let g = rgb.greenComponent
-        let b = rgb.blueComponent
-        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-        return lum > 0.6 ? .black : .white
     }
 
     private func renderSnakeImage(color: NSColor, size: CGSize) -> CGImage? {
