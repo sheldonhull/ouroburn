@@ -191,4 +191,57 @@ struct DiskCache {
         return base.appendingPathComponent("ouroburn", isDirectory: true)
             .appendingPathComponent("billing.json")
     }
+
+    static func defaultEntriesURL() -> URL {
+        let base = FileManager.default
+            .urls(for: .cachesDirectory, in: .userDomainMask)
+            .first ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("ouroburn", isDirectory: true)
+            .appendingPathComponent("entries.plist")
+    }
+}
+
+/// Persisted form of `BurnTracker.fileCache` so relaunches skip the multi-GB JSONL reparse.
+/// Encoded as binary property list (faster + denser than JSON for ~250k `UsageEntry`s).
+/// Schema is version-tagged; bumping `currentVersion` invalidates older caches without
+/// throwing — the loader simply returns nil and the tracker falls back to a cold parse.
+struct PersistedEntriesCache: Codable, Sendable {
+    static let currentVersion = 1
+
+    let version: Int
+    let savedAt: Date
+    let files: [PersistedFile]
+
+    struct PersistedFile: Codable, Sendable {
+        let path: String
+        let modifiedAt: Date
+        let byteSize: UInt64
+        let entries: [UsageEntry]
+    }
+}
+
+extension DiskCache {
+    static func loadPersistedEntries(at url: URL = DiskCache.defaultEntriesURL()) -> PersistedEntriesCache? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = PropertyListDecoder()
+        guard let cache = try? decoder.decode(PersistedEntriesCache.self, from: data) else {
+            return nil
+        }
+        guard cache.version == PersistedEntriesCache.currentVersion else { return nil }
+        return cache
+    }
+
+    static func savePersistedEntries(
+        _ cache: PersistedEntriesCache,
+        at url: URL = DiskCache.defaultEntriesURL()
+    ) {
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard let data = try? encoder.encode(cache) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
 }

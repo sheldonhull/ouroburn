@@ -16,9 +16,15 @@ final class OuroborosView: NSView {
     private var glowColor: NSColor = OuroborosView.idleColor.withAlphaComponent(0.55)
     private var lastTickTime: CFTimeInterval = CACurrentMediaTime()
     private var lastDrawTime: CFTimeInterval = 0
-    /// Cap redraws to ~30 fps. Doubling the budget over the displayLink rate is invisible to the
-    /// user but halves the main-thread cost of geometric ouroboros drawing.
-    private let frameInterval: CFTimeInterval = 1.0 / 30.0
+    private var lastDrawnPhase: CGFloat = 0
+    /// Idle redraw cap. The snake's slow base rotation (~0.1 RPS) advances ~3° per frame at
+    /// 12 fps — still reads as "spinning" but slashes per-frame `drawSnake` cost. We bump up
+    /// when the burn rate climbs (see `tick`) so a real spike is still visually responsive.
+    private let idleFrameInterval: CFTimeInterval = 1.0 / 12.0
+    private let activeFrameInterval: CFTimeInterval = 1.0 / 30.0
+    /// Minimum angular change required to repaint. At idle RPS this dominates the throttle and
+    /// keeps the GPU mostly idle even though the displayLink keeps ticking.
+    private let minPhaseDeltaDegrees: CGFloat = 2.5
 
     static let idleColor = Theme.accentBlue
     static let warmColor = Theme.accentMint
@@ -97,11 +103,16 @@ final class OuroborosView: NSView {
         lastTickTime = now
         phase += rotationsPerSecond * CGFloat(dt) * (2 * .pi)
         if phase > 2 * .pi { phase -= 2 * .pi }
-        // Throttle invalidation: at 60Hz CVDisplayLink, only mark dirty every other frame.
-        if now - lastDrawTime >= frameInterval {
-            lastDrawTime = now
-            needsDisplay = true
-        }
+        // Adaptive frame budget: hot RPS warrants the higher cap so a spike animates smoothly;
+        // at idle we coast at 12 fps so a 5+ CPU% draw cost doesn't follow us into Activity
+        // Monitor. The phase-delta guard short-circuits identical frames entirely.
+        let interval = rotationsPerSecond > Self.baseRPS ? activeFrameInterval : idleFrameInterval
+        guard now - lastDrawTime >= interval else { return }
+        let deltaDegrees = abs(phase - lastDrawnPhase) * 180 / .pi
+        guard deltaDegrees >= minPhaseDeltaDegrees else { return }
+        lastDrawTime = now
+        lastDrawnPhase = phase
+        needsDisplay = true
     }
 
     override func draw(_: NSRect) {

@@ -4,7 +4,7 @@ import Foundation
 ///
 /// Source schema documented in ccusage `data-loader.ts:167-193`. Optional fields are missing
 /// or null in the raw JSONL; tokens default to zero so downstream math stays clean.
-struct UsageEntry: Equatable, Sendable {
+struct UsageEntry: Equatable, Sendable, Codable {
     let timestamp: Date
     let model: String?
     let inputTokens: Int

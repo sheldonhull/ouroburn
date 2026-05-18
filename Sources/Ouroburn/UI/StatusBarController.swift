@@ -42,9 +42,18 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
         metrics.onModeChange = { [weak tracker] mode in tracker?.setMode(mode) }
         metrics.onLoginClick = { [weak self] in self?.onLoginRequested?() }
         metrics.onMonthlyTileClick = { [weak self] in self?.onShowSpendHistory?() }
-        metrics.setConnectionState(
-            OAuthCredentialStore.load() != nil ? .connected(spendUSD: nil) : .disconnected
-        )
+        // Keychain access can pop a TCC prompt that blocks indefinitely if the user doesn't
+        // notice it (menu-bar app, no front window). Defer the credential probe so app launch
+        // isn't gated on Keychain availability. The connection chip starts as `.disconnected`;
+        // the async probe upgrades it once the system responds.
+        metrics.setConnectionState(.disconnected)
+        DispatchQueue.global(qos: .utility).async { [weak metrics] in
+            let hasCredential = OAuthCredentialStore.load() != nil
+            guard hasCredential else { return }
+            DispatchQueue.main.async {
+                metrics?.setConnectionState(.connected(spendUSD: nil))
+            }
+        }
     }
 
     func setConnectionState(_ state: MetricsViewController.ConnectionState) {
@@ -55,15 +64,25 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
         iconView.update(liveRate: snapshot.tokensPerMinute, medianRate: snapshot.medianTokensPerMinute)
         metrics.update(snapshot: snapshot)
         if let button = item.button {
-            button.toolTip = String(
-                format: "ouroburn — %.0f tok/min · ~$%.2f/hr",
-                snapshot.tokensPerMinute, snapshot.costPerHour
-            )
+            button.toolTip = "ouroburn — "
+                + NumberFormatting.compactRate(tokensPerMinute: snapshot.tokensPerMinute)
+                + " · "
+                + NumberFormatting.compactRate(dollarsPerHour: snapshot.costPerHour)
         }
     }
 
     func applyLive(snapshot: LiveSnapshot) {
         metrics.applyLive(snapshot: snapshot)
+        // Live tooltip + icon only when there's actual activity in the rolling 60s window.
+        // Idle (rate == 0) defers to the 60s `render(snapshot:)` path so the tooltip doesn't flicker.
+        guard snapshot.tokensPerMinute > 0 else { return }
+        iconView.update(liveRate: snapshot.tokensPerMinute, medianRate: snapshot.tokensPerMinute)
+        if let button = item.button {
+            button.toolTip = "ouroburn — "
+                + NumberFormatting.compactRate(tokensPerMinute: snapshot.tokensPerMinute)
+                + " · "
+                + NumberFormatting.compactRate(dollarsPerHour: snapshot.costPerHour)
+        }
     }
 
     func applyBillingHealth(_ health: BillingHealth) {
@@ -91,7 +110,6 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
         if popover.isShown {
             popover.performClose(nil)
             tracker.stopLiveTracking()
-            tracker.setBillingForegroundActive(false)
         } else {
             // Refresh the live priority panel from the cached snapshot before the popover slides
             // in so the OAuth heartbeat + top-5 sessions read fresh on every open.
@@ -101,9 +119,6 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
             // Tail-read JSONLs every 2s while the popover is visible. Stops on close so we don't
             // pay incremental I/O when nobody is looking at the numbers.
             tracker.startLiveTracking()
-            // Bump OAuth billing cadence to a 60s floor while the popover is open. Cooldown +
-            // upstream 429 backoff still apply — this just shortens the *baseline*.
-            tracker.setBillingForegroundActive(true)
         }
     }
 

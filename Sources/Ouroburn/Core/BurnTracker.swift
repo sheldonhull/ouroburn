@@ -151,7 +151,11 @@ final class BurnTracker: @unchecked Sendable {
     static let billingTickInterval: TimeInterval = 30
     static let spikeMultiplierDefault: Double = 2.0
     static let spikeMinimumRateDefault: Double = 500
-    static let liveTickInterval: TimeInterval = 2
+    static let liveTickInterval: TimeInterval = 4
+    /// Min interval between `entries.plist` writes. Cap to avoid hammering the disk on hot
+    /// sessions where every poll updates a couple files. 2 min is plenty — relaunch cost-savings
+    /// scale with `(time since last save)`, not write frequency.
+    static let entriesPersistInterval: TimeInterval = 120
     static let liveWindowSeconds: TimeInterval = 60
 
     private let loader: JSONLLoader
@@ -165,6 +169,11 @@ final class BurnTracker: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var billingTimer: DispatchSourceTimer?
     private var liveTimer: DispatchSourceTimer?
+    private var fileWatcher: SessionFileWatcher?
+
+    private enum Trigger {
+        case timer, watcher, force
+    }
 
     private struct State {
         var pricingTable: [String: ModelPricing] = [:]
@@ -204,6 +213,16 @@ final class BurnTracker: @unchecked Sendable {
         /// `onToast` callback fires and `lastToastFiredAt` advances to enforce cooldown.
         var firstBreachAt: Date?
         var lastToastFiredAt: Date?
+        /// Timestamp of the last actual poll() execution. Watcher-triggered polls within 2s of
+        /// the previous one short-circuit; timer + force triggers always proceed.
+        var lastPollAt: Date?
+        /// Per-file mtime fingerprint of the prior successful poll. When the fingerprint matches
+        /// the new sweep, the tree hasn't changed and a watcher tick can skip the entire merge /
+        /// dedup / sort / aggregate pipeline — the prior `lastSnapshot` is still authoritative.
+        var lastFileFingerprint: UInt64 = 0
+        /// Last time the file-cache was persisted to disk. Throttles the ~30-60 MB binary-plist
+        /// write to once per `entriesPersistInterval`.
+        var lastEntriesPersistedAt: Date?
     }
 
     func applyPreferences(_ prefs: Preferences) {
@@ -221,19 +240,6 @@ final class BurnTracker: @unchecked Sendable {
         }
         if let billingService {
             Task { await billingService.setPollInterval(minutes: prefs.oauthRefreshMinutes) }
-        }
-    }
-
-    /// Toggles the OAuth billing foreground boost. Called when the popover opens/closes so the
-    /// monthly tile keeps near-real-time pace without changing the user's saved cadence. Cooldown
-    /// + 429 backoff still gate the actual upstream fetch.
-    func setBillingForegroundActive(_ active: Bool) {
-        guard let billingService else { return }
-        Task { await billingService.setForegroundActive(active) }
-        if active {
-            // Trigger an immediate billing tick so the user sees a fresh number on open instead
-            // of waiting up to 30s for the next regular billing tick.
-            queue.async { [weak self] in self?.fetchBilling() }
         }
     }
 
@@ -314,6 +320,31 @@ final class BurnTracker: @unchecked Sendable {
             $0.lastSnapshot = snapshot
             $0.billedMonthUSD = cached.billedMonthUSD
         }
+
+        // Seed `fileCache` from the persisted entries cache. Without this, every launch
+        // re-parses ~2500 jsonl files (~30-60s, 5-core burn). With it, the next poll only
+        // reparses files whose mtime has advanced since the cache was written — typically zero.
+        if let persisted = DiskCache.loadPersistedEntries() {
+            var seeded: [URL: CachedFile] = [:]
+            seeded.reserveCapacity(persisted.files.count)
+            for file in persisted.files {
+                let url = URL(fileURLWithPath: file.path)
+                seeded[url] = CachedFile(modifiedAt: file.modifiedAt, entries: file.entries)
+            }
+            let snapshot = seeded
+            state.withLock { $0.fileCache = snapshot }
+            Log.info(
+                Log.tracker,
+                "Bootstrap loaded \(snapshot.count) cached file entries (age \(Int(Date().timeIntervalSince(persisted.savedAt)))s)"
+            )
+        }
+
+        if let billingService {
+            Task { [weak self, billingService] in
+                let health = await billingService.currentHealth()
+                self?.onBillingHealth?(health)
+            }
+        }
         return snapshot
     }
 
@@ -324,15 +355,28 @@ final class BurnTracker: @unchecked Sendable {
             let table = await pricingService.currentTable()
             state.withLock { $0.pricingTable = table }
             Log.info(Log.tracker, "Pricing table loaded: \(table.count) models")
-            queue.async { [weak self] in self?.poll() }
+            queue.async { [weak self] in self?.poll(trigger: .timer) }
             queue.async { [weak self] in self?.fetchBilling() }
         }
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
-        timer.setEventHandler { [weak self] in self?.poll() }
+        timer.setEventHandler { [weak self] in self?.poll(trigger: .timer) }
         timer.resume()
         self.timer = timer
+
+        let watcher = SessionFileWatcher(roots: loader.claudeRoots()) { [weak self] in
+            guard let self else { return }
+            // Don't invalidate the transcript-list cache here. While the user is actively coding,
+            // FSEvents fires many times per second; invalidating the cache each fire defeats the
+            // 30s TTL and lets `liveTick` rewalk 2k+ files on every iteration. Existing sessions
+            // are tail-read by liveTick directly; new sessions will appear after the next TTL
+            // expiry (≤30s lag) — acceptable for menu-bar use.
+            queue.async { [weak self] in self?.poll(trigger: .watcher) }
+        }
+        watcher.start()
+        fileWatcher = watcher
+        Log.info(Log.tracker, "SessionFileWatcher started over \(loader.claudeRoots().count) root(s)")
 
         if billingService != nil {
             let bt = DispatchSource.makeTimerSource(queue: queue)
@@ -356,7 +400,7 @@ final class BurnTracker: @unchecked Sendable {
         if let billingService {
             Task { await billingService.invalidate() }
         }
-        queue.async { [weak self] in self?.poll() }
+        queue.async { [weak self] in self?.poll(trigger: .force) }
         queue.async { [weak self] in self?.fetchBilling() }
     }
 
@@ -568,12 +612,18 @@ final class BurnTracker: @unchecked Sendable {
         struct Pair { let rate: Double; let amount: Double; let at: Date }
         var pairs: [Pair] = []
         pairs.reserveCapacity(samples.count - 1)
+        // OAuth `extra_used_usd` updates on minute-ish cadence with billing-period resets.
+        // Pairs whose sample gap is under 60s (force-refresh racing a regular tick) divide a
+        // real-but-stale delta by a tiny denominator and produce six-figure $/hr ghosts.
+        // Skip them entirely.
+        let minIntervalSeconds: TimeInterval = 60
         for index in 1 ..< samples.count {
             let prior = samples[index - 1]
             let current = samples[index]
+            let elapsed = current.timestamp.timeIntervalSince(prior.timestamp)
+            guard elapsed >= minIntervalSeconds else { continue }
             let amount = max(0, current.totalUSD - prior.totalUSD)
-            let minutes = max(current.timestamp.timeIntervalSince(prior.timestamp) / 60, 1.0 / 60.0)
-            let rate = amount / minutes * 60 // $/hr
+            let rate = amount / elapsed * 3600
             pairs.append(Pair(rate: rate, amount: amount, at: current.timestamp))
         }
         guard let latest = pairs.last, latest.amount > 0 else { return }
@@ -629,27 +679,47 @@ final class BurnTracker: @unchecked Sendable {
         timer = nil
         billingTimer?.cancel()
         billingTimer = nil
+        fileWatcher?.stop()
+        fileWatcher = nil
     }
 
     /// Load all entries, reparsing only files whose modification time differs from the cache.
     /// Stale files are parsed in parallel via `DispatchQueue.concurrentPerform` — the first poll
     /// after launch is the only expensive one (1.8k files / multi-GB), and parallel I/O cuts it
     /// from ~5 min to ~30 s on a typical SSD.
-    private func loadEntries(using cache: [URL: CachedFile]) -> (entries: [UsageEntry], cache: [URL: CachedFile]) {
+    ///
+    /// Returns `nil` from `entries` when the per-file mtime fingerprint matches the cached one
+    /// AND the prior merged buffer is reusable — callers MUST then keep using their prior
+    /// `merged` array. Skipping the merge / dedup / sort over 250k+ entries cuts watcher-tick
+    /// CPU from "burning 5 cores" to a no-op.
+    private func loadEntries(
+        using cache: [URL: CachedFile],
+        priorFingerprint: UInt64
+    ) -> (entries: [UsageEntry]?, cache: [URL: CachedFile], fingerprint: UInt64) {
         let files = loader.transcriptFiles()
         var staleEntries: [URL] = []
         var nextCache: [URL: CachedFile] = [:]
         nextCache.reserveCapacity(files.count)
         var reused = 0
+        var fingerprint = UInt64(files.count) &* 1_469_598_103_934_665_603
 
         for url in files {
             let mtime = loader.modificationDate(for: url)
+            // FNV-like rolling hash over (path, mtime). Order-independent across files.
+            let bits = UInt64(bitPattern: Int64(mtime.timeIntervalSince1970 * 1000))
+            fingerprint ^= UInt64(truncatingIfNeeded: url.path.hashValue) &* 1_099_511_628_211
+            fingerprint ^= bits &* 1_099_511_628_211
             if let cached = cache[url], cached.modifiedAt == mtime {
                 nextCache[url] = cached
                 reused += 1
             } else {
                 staleEntries.append(url)
             }
+        }
+
+        if staleEntries.isEmpty, fingerprint == priorFingerprint {
+            Log.debug(Log.tracker, "Load short-circuit: fingerprint matched, reused=\(reused)")
+            return (nil, nextCache, fingerprint)
         }
 
         if !staleEntries.isEmpty {
@@ -686,7 +756,28 @@ final class BurnTracker: @unchecked Sendable {
         }
         merged.sort { $0.timestamp < $1.timestamp }
         Log.info(Log.tracker, "Load reparsed=\(reparsed) reused=\(reused) merged=\(merged.count)")
-        return (merged, nextCache)
+        return (merged, nextCache, fingerprint)
+    }
+
+    /// Serialize the in-memory `fileCache` to disk so the next launch skips the cold reparse.
+    /// Runs on the tracker queue; binary-plist encode of ~250k `UsageEntry`s takes a few hundred
+    /// ms on modern Apple Silicon and is throttled by `entriesPersistInterval`.
+    private func persistFileCache(_ cache: [URL: CachedFile]) {
+        let files = cache.map { url, cached in
+            PersistedEntriesCache.PersistedFile(
+                path: url.path,
+                modifiedAt: cached.modifiedAt,
+                byteSize: 0,
+                entries: cached.entries
+            )
+        }
+        let payload = PersistedEntriesCache(
+            version: PersistedEntriesCache.currentVersion,
+            savedAt: Date(),
+            files: files
+        )
+        DiskCache.savePersistedEntries(payload)
+        Log.info(Log.tracker, "Persisted \(files.count) cached files to entries.plist")
     }
 
     private static func median(of values: [Double]) -> Double {
@@ -696,8 +787,30 @@ final class BurnTracker: @unchecked Sendable {
         return sorted.count.isMultiple(of: 2) ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
     }
 
-    private func poll() {
-        let (mode, table, previous, fileCacheSnapshot, history, spikeMultiplier, spikeMinimumRate) = state
+    private func poll(trigger: Trigger = .timer) {
+        if trigger == .watcher {
+            let lastPollAt = state.withLock { $0.lastPollAt }
+            // Watcher-triggered polls are expensive (merge + dedup + 4× aggregate over the full
+            // entry set) and an active Claude Code session writes JSONL many times per second.
+            // The 2s live tick keeps the menu-bar tooltip + headline rate fresh; tile totals
+            // can wait. Hard-floor watcher polls at 20s. The 60s safety timer still ticks.
+            if let last = lastPollAt, Date().timeIntervalSince(last) < 20 {
+                Log.debug(Log.tracker, "Poll skipped (watcher within 20s of last poll)")
+                return
+            }
+        }
+        state.withLock { $0.lastPollAt = Date() }
+
+        let (
+            mode,
+            table,
+            previous,
+            fileCacheSnapshot,
+            history,
+            spikeMultiplier,
+            spikeMinimumRate,
+            priorFingerprint
+        ) = state
             .withLock { state -> (
                 ViewMode,
                 [String: ModelPricing],
@@ -705,7 +818,8 @@ final class BurnTracker: @unchecked Sendable {
                 [URL: CachedFile],
                 [Double],
                 Double,
-                Double
+                Double,
+                UInt64
             ) in
                 (
                     state.activeMode,
@@ -714,7 +828,8 @@ final class BurnTracker: @unchecked Sendable {
                     state.fileCache,
                     state.rateHistory,
                     state.spikeMultiplier,
-                    state.spikeMinimumRate
+                    state.spikeMinimumRate,
+                    state.lastFileFingerprint
                 )
             }
 
@@ -725,7 +840,24 @@ final class BurnTracker: @unchecked Sendable {
         onRefreshStateChanged?(RefreshState(isRefreshing: true, message: startMessage))
 
         let now = Date()
-        let (entries, updatedCache) = loadEntries(using: fileCacheSnapshot)
+        let (maybeEntries, updatedCache, fingerprint) = loadEntries(
+            using: fileCacheSnapshot,
+            priorFingerprint: priorFingerprint
+        )
+        // Fingerprint matched → tree unchanged → the prior snapshot is still authoritative.
+        // Re-emit it (so subscribers can refresh timestamps) but skip merge / aggregation.
+        if let last = state.withLock({ $0.lastSnapshot }), maybeEntries == nil {
+            state.withLock { $0.fileCache = updatedCache }
+            onUpdate?(last)
+            onRefreshStateChanged?(RefreshState(isRefreshing: false, message: ""))
+            return
+        }
+        guard let entries = maybeEntries else {
+            // No prior snapshot to fall back on (cold launch with empty fileCache but matched
+            // fingerprint — shouldn't happen in practice). Force a real load via loadAll.
+            onRefreshStateChanged?(RefreshState(isRefreshing: false, message: ""))
+            return
+        }
         Log.info(
             Log.tracker,
             "Poll mode=\(mode.rawValue) entries=\(entries.count) cachedFiles=\(updatedCache.count) pricing=\(table.count)"
@@ -800,6 +932,23 @@ final class BurnTracker: @unchecked Sendable {
             $0.lastSnapshot = snapshot
             $0.fileCache = updatedCache
             $0.rateHistory = nextHistory
+            $0.lastFileFingerprint = fingerprint
+        }
+
+        // Persist parsed entries so the next launch can skip the cold reparse. Throttled to
+        // once per `entriesPersistInterval` to amortize the binary-plist write (~30-60 MB) over
+        // multiple polls. The serialization itself runs on the background `queue` already.
+        let shouldPersist: Bool = state.withLock { state in
+            if let last = state.lastEntriesPersistedAt,
+               Date().timeIntervalSince(last) < Self.entriesPersistInterval
+            {
+                return false
+            }
+            state.lastEntriesPersistedAt = Date()
+            return true
+        }
+        if shouldPersist {
+            persistFileCache(updatedCache)
         }
 
         let activeBuckets = bucketsByMode[mode] ?? []

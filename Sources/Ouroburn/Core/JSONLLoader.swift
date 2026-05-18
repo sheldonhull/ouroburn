@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Loads UsageEntry records from Claude Code transcripts.
 ///
@@ -35,11 +36,20 @@ struct JSONLLoader {
             .filter { hasProjectsDir($0) }
     }
 
-    /// All `*.jsonl` files under each root's `projects/` directory.
+    /// All `*.jsonl` files under each root's `projects/` directory. Cached for
+    /// `transcriptCacheTTL` seconds — the 2s live tick and 60s poll both walked the tree on
+    /// every call previously, which on a busy account (2.5k+ sessions) was ~100 ms of
+    /// `FileManager.enumerator` work every 2s. New sessions are still picked up well within
+    /// the TTL because the FSEvents-based `SessionFileWatcher` invalidates this cache.
     func transcriptFiles() -> [URL] {
+        let now = Date()
+        if let cached = Self.transcriptCache.withLock({ $0 }),
+           now.timeIntervalSince(cached.cachedAt) < Self.transcriptCacheTTL
+        {
+            return cached.files
+        }
         var files: [URL] = []
         let roots = claudeRoots()
-        Log.info(Log.loader, "Claude roots: \(roots.map(\.path).joined(separator: ", "))")
         for root in roots {
             let projects = root.appendingPathComponent("projects")
             guard let enumerator = fileManager.enumerator(
@@ -53,9 +63,25 @@ struct JSONLLoader {
                 files.append(url)
             }
         }
-        Log.info(Log.loader, "Discovered \(files.count) transcript files")
-        return files
+        Log.debug(Log.loader, "Discovered \(files.count) transcript files (refreshed cache)")
+        let snapshot = files
+        Self.transcriptCache.withLock { $0 = TranscriptCacheEntry(cachedAt: now, files: snapshot) }
+        return snapshot
     }
+
+    /// Drop the cached transcript list so the next call re-walks. Hook for the FS watcher to
+    /// call whenever a structural change (new project dir, new session) is observed.
+    static func invalidateTranscriptCache() {
+        transcriptCache.withLock { $0 = nil }
+    }
+
+    private static let transcriptCacheTTL: TimeInterval = 30
+    private struct TranscriptCacheEntry {
+        let cachedAt: Date
+        let files: [URL]
+    }
+
+    private static let transcriptCache = OSAllocatedUnfairLock<TranscriptCacheEntry?>(initialState: nil)
 
     /// Reads one transcript file end to end, normalizing each valid line into a UsageEntry.
     /// `seenKeys` is mutated to track dedup state across files within the same load pass.
