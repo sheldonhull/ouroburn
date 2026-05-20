@@ -149,40 +149,20 @@ final class BillingHistoryWindowController: NSWindowController {
         }
         dayOrder.sort(by: >)
 
-        // Calendar-month-to-date — sum positive consecutive deltas across all samples since the
-        // first of the current calendar month, ignoring resets. Anthropic's `extra_used_usd`
-        // collapses to zero at billing-period rollover, so a mid-month reset would otherwise
-        // make the MTD column appear to shrink. Compute once per reload, indexed by start-of-day.
-        var mtdByDay: [Date: Double] = [:]
-        let monthStart: Date = {
-            let comps = calendar.dateComponents([.year, .month], from: Date())
-            return calendar.date(from: comps) ?? Date.distantPast
-        }()
-        var running: Double = 0
-        var priorForMTD: BillingSample?
-        for entry in paired {
-            if entry.sample.timestamp >= monthStart {
-                if let p = priorForMTD {
-                    let delta = entry.sample.totalUSD - p.totalUSD
-                    if delta > 0 { running += delta }
-                }
-                mtdByDay[calendar.startOfDay(for: entry.sample.timestamp)] = running
-            }
-            priorForMTD = entry.sample
-        }
-
+        // MTD column shows Anthropic's `extra_used_usd` as-is — the last sample of the day. This
+        // matches what the OAuth API reports and what the user sees in Anthropic's console. A
+        // prior implementation synthesized a "reset-robust" running total by summing positive
+        // deltas across the month, but unfiltered troughs (Anthropic glitches that didn't
+        // recover within 30 min because the laptop slept) caused the recovery jump to be
+        // counted as growth and inflated the row by thousands of dollars.
         var rows: [DayRow] = []
         for day in dayOrder {
             let entries = groups[day] ?? []
             let first = entries.first?.sample.totalUSD ?? 0
             let last = entries.last?.sample.totalUSD ?? 0
             let dayDelta = max(0, last - first)
-            // Show samples newest-first inside the day.
             let ordered = entries.sorted { $0.sample.timestamp > $1.sample.timestamp }
-            // MTD column reflects reset-robust cumulative spend; falls back to the in-day latest
-            // value for days that pre-date the current calendar month (history beyond the month).
-            let mtdValue = mtdByDay[day] ?? last
-            rows.append(DayRow(day: day, samples: ordered, latest: mtdValue, dayDelta: dayDelta))
+            rows.append(DayRow(day: day, samples: ordered, latest: last, dayDelta: dayDelta))
         }
 
         dayRows = rows

@@ -117,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         notifier?.requestAuthorization()
         tracker.start()
+        Log.info(Log.app, "LaunchAtLogin status at startup: enabled=\(LaunchAtLogin.isEnabled())")
         Log.info(Log.app, "applicationDidFinishLaunching complete")
     }
 

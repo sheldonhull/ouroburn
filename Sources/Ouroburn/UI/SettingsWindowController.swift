@@ -587,11 +587,21 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             launchAtLoginEnabled: wantsLaunchAtLogin
         )
         PreferencesStore.save(prefs)
-        LaunchAtLogin.apply(enabled: wantsLaunchAtLogin) { [weak self] error in
+        LaunchAtLogin.apply(enabled: wantsLaunchAtLogin) { [weak self] result in
             guard let self else { return }
-            if let error {
+            switch result {
+            case let .failure(error):
                 statusLabel.stringValue = "Launch-at-login: \(error.localizedDescription)"
                 launchAtLoginSwitch.state = LaunchAtLogin.isEnabled() ? .on : .off
+            case let .success(status):
+                switch status {
+                case .requiresApproval:
+                    statusLabel.stringValue = "Launch-at-login needs approval — opening Login Items"
+                    LaunchAtLogin.openLoginItemsSettings()
+                    launchAtLoginSwitch.state = .off
+                case .enabled, .notRegistered, .notFound, .unknown:
+                    launchAtLoginSwitch.state = LaunchAtLogin.isEnabled() ? .on : .off
+                }
             }
         }
 
