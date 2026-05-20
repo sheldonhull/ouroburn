@@ -4,18 +4,37 @@ import Testing
 
 @Suite("Pricing")
 struct PricingServiceTests {
-    @Test func decodeFiltersOutModelsWithoutClaudeFields() {
+    @Test func decodeFlattensModelsDevProviders() throws {
         let json = """
         {
-          "claude-sonnet-4-20250514": {"input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015},
-          "useless-model": {"unrelated_field": 1.0},
-          "claude-opus-4-20250620": {"input_cost_per_token": 0.000015}
+          "anthropic": {
+            "models": {
+              "claude-opus-4-7": {
+                "cost": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}
+              },
+              "missing-cost": {}
+            }
+          },
+          "openai": {
+            "models": {
+              "gpt-9000": {
+                "cost": {"input": 10, "output": 30}
+              }
+            }
+          },
+          "junk-provider": {"no_models_key": true}
         }
         """.data(using: .utf8)!
         let table = PricingService.decode(feed: json)
-        #expect(table.count == 2)
-        #expect(table["claude-sonnet-4-20250514"] != nil)
-        #expect(table["useless-model"] == nil)
+        let opus = try #require(table["claude-opus-4-7"])
+        #expect(abs(opus.inputCostPerToken - 0.000005) < 1e-12)
+        #expect(abs(opus.outputCostPerToken - 0.000025) < 1e-12)
+        #expect(abs(opus.cacheReadCostPerToken - 0.0000005) < 1e-12)
+        #expect(abs(opus.cacheCreationCostPerToken - 0.00000625) < 1e-12)
+        #expect(table["anthropic/claude-opus-4-7"] != nil)
+        #expect(table["gpt-9000"] != nil)
+        #expect(table["openai/gpt-9000"] != nil)
+        #expect(table["missing-cost"] == nil)
     }
 
     @Test func costFormulaUsesPerTokenRates() {

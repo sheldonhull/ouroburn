@@ -1,9 +1,9 @@
 import Foundation
 
-/// Per-token pricing table sourced from LiteLLM's open price feed.
+/// Per-token pricing table sourced from the models.dev open price feed.
 ///
-/// Source: ccusage `_pricing-fetcher.ts` and `packages/internal/src/pricing.ts:4`.
-/// Prices are PER TOKEN (not per million); see `pricing.ts:267` for the formula.
+/// Schema: `{provider}.models.{id}.cost.{input|output|cache_read|cache_write}` in $/Mtok.
+/// We flatten across providers and convert to per-token rates.
 struct ModelPricing: Sendable, Equatable {
     let inputCostPerToken: Double
     let outputCostPerToken: Double
@@ -12,10 +12,9 @@ struct ModelPricing: Sendable, Equatable {
 }
 
 actor PricingService {
-    static let feedURL =
-        URL(string: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json")!
-    static let prefixCandidates = ["", "anthropic/", "claude-3-5-", "claude-3-", "claude-", "openrouter/openai/"]
-    static let cacheTTL: TimeInterval = 24 * 60 * 60
+    static let feedURL = URL(string: "https://models.dev/api.json")!
+    static let prefixCandidates = ["", "anthropic/", "openai/", "google/", "openrouter/"]
+    static let cacheTTL: TimeInterval = 7 * 24 * 60 * 60
 
     private let cacheURL: URL
     private let session: URLSession
@@ -60,7 +59,7 @@ actor PricingService {
             table = fresh
             loadedAt = Date()
             writeDiskCache(table: fresh, loadedAt: loadedAt!)
-            Log.info(Log.pricing, "Fetched \(fresh.count) entries from LiteLLM feed")
+            Log.info(Log.pricing, "Fetched \(fresh.count) entries from models.dev feed")
             return
         } catch {
             Log.error(Log.pricing, "Remote fetch failed: \(error.localizedDescription); falling back to disk cache")
@@ -97,22 +96,33 @@ actor PricingService {
     }
 
     static func decode(feed data: Data) -> [String: ModelPricing] {
-        guard let any = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
         var out: [String: ModelPricing] = [:]
-        for (key, value) in any {
-            guard let dict = value as? [String: Any] else { continue }
-            let pricing = ModelPricing(
-                inputCostPerToken: (dict["input_cost_per_token"] as? Double) ?? 0,
-                outputCostPerToken: (dict["output_cost_per_token"] as? Double) ?? 0,
-                cacheCreationCostPerToken: (dict["cache_creation_input_token_cost"] as? Double) ?? 0,
-                cacheReadCostPerToken: (dict["cache_read_input_token_cost"] as? Double) ?? 0
-            )
-            // Skip rows with no Claude-style fields populated.
-            if pricing.inputCostPerToken == 0, pricing.outputCostPerToken == 0,
-               pricing.cacheCreationCostPerToken == 0, pricing.cacheReadCostPerToken == 0 { continue }
-            out[key] = pricing
+        for (providerKey, providerValue) in root {
+            guard let provider = providerValue as? [String: Any],
+                  let models = provider["models"] as? [String: Any] else { continue }
+            for (modelId, modelValue) in models {
+                guard let model = modelValue as? [String: Any],
+                      let cost = model["cost"] as? [String: Any] else { continue }
+                let pricing = ModelPricing(
+                    inputCostPerToken: perToken(cost["input"]),
+                    outputCostPerToken: perToken(cost["output"]),
+                    cacheCreationCostPerToken: perToken(cost["cache_write"]),
+                    cacheReadCostPerToken: perToken(cost["cache_read"])
+                )
+                if pricing.inputCostPerToken == 0, pricing.outputCostPerToken == 0,
+                   pricing.cacheCreationCostPerToken == 0, pricing.cacheReadCostPerToken == 0 { continue }
+                // Bare id wins when both forms collide (models.dev exposes canonical ids).
+                out[modelId] = pricing
+                out["\(providerKey)/\(modelId)"] = pricing
+            }
         }
         return out
+    }
+
+    private static func perToken(_ value: Any?) -> Double {
+        guard let raw = (value as? NSNumber)?.doubleValue else { return 0 }
+        return raw / 1_000_000
     }
 
     private func readDiskCache() -> (table: [String: ModelPricing], loadedAt: Date)? {

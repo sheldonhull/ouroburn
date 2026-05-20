@@ -742,18 +742,22 @@ final class BurnTracker: @unchecked Sendable {
         }
         let reparsed = staleEntries.count
 
-        // Merge with cross-file dedup (mirrors ccusage `data-loader.ts:530`).
-        var seen = Set<String>()
-        var merged: [UsageEntry] = []
+        // Merge with cross-file dedup. Claude Code can write multiple JSONL rows per
+        // (messageId, requestId) — streaming-delta snapshots where output_tokens grows
+        // monotonically across writes. Keep the row with the highest totalTokens per key
+        // so cost reflects the final completion rather than an intermediate partial.
+        // Entries missing either id half are kept as-is (no dedup possible).
+        var byKey: [String: UsageEntry] = [:]
+        var unkeyed: [UsageEntry] = []
         for cached in nextCache.values {
             for entry in cached.entries {
-                if let key = entry.dedupKey {
-                    if seen.contains(key) { continue }
-                    seen.insert(key)
-                }
-                merged.append(entry)
+                guard let key = entry.dedupKey else { unkeyed.append(entry); continue }
+                if let existing = byKey[key], existing.totalTokens >= entry.totalTokens { continue }
+                byKey[key] = entry
             }
         }
+        var merged = Array(byKey.values)
+        merged.append(contentsOf: unkeyed)
         merged.sort { $0.timestamp < $1.timestamp }
         Log.info(Log.tracker, "Load reparsed=\(reparsed) reused=\(reused) merged=\(merged.count)")
         return (merged, nextCache, fingerprint)
