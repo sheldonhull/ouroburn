@@ -23,7 +23,7 @@ final class Notifier {
         }
     }
 
-    func deliverSpike(currentRate: Double, previousRate: Double, costPerHour: Double) {
+    func deliverSpike(currentRate: Double, previousRate: Double, todayCostUSD: Double) {
         guard authorized else { return }
         if let last = lastDelivered, Date().timeIntervalSince(last) < cooldown { return }
 
@@ -31,8 +31,8 @@ final class Notifier {
         content.title = "ouroburn — burn rate spike"
         let now = NumberFormatting.compactRate(tokensPerMinute: currentRate)
         let was = NumberFormatting.compactRate(tokensPerMinute: previousRate)
-        let cph = NumberFormatting.compactRate(dollarsPerHour: costPerHour)
-        content.body = "Now \(now) (was \(was)). \(cph) at this pace."
+        let today = NumberFormatting.compactDollars(todayCostUSD)
+        content.body = "Now \(now) (was \(was)). \(today) spent today."
         content.sound = .default
 
         let request = UNNotificationRequest(

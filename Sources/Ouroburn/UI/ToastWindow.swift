@@ -1,25 +1,41 @@
 import AppKit
+import CoreGraphics
 
 /// In-app toast surfaced when the live USD/hr breaches the user's threshold or hits a new daily
 /// peak. Implemented as a non-activating floating panel pinned to the top-right of the active
 /// screen — chosen over `UNUserNotification` because the user explicitly wanted an on-screen
 /// signal that doesn't depend on Notification Center being visible.
 ///
-/// Behavior: toast stays pinned until the user clicks the X / Dismiss button (or anywhere on the
-/// body). Caller-provided duration values are accepted but ignored — earlier auto-dismiss was
-/// removed at the user's request so a brief glance away doesn't lose the alert.
+/// Behavior: idle-aware auto-dismiss. If the user is at the machine (low input-idle time) they've
+/// already seen the toast, so it self-closes after `activeDismissSeconds`. If the machine is idle
+/// (user away) the toast stays pinned and the dismiss check reschedules — so it survives until the
+/// user returns, becomes active, and the next check fires. A click always dismisses immediately.
 @MainActor
 final class ToastWindow {
     private let panel: NSPanel
+    private var dismissWork: DispatchWorkItem?
+
+    /// Input-idle threshold separating "user present" from "user away". Below this the user is
+    /// treated as active (saw the toast); at/above it the toast persists.
+    private static let idleThresholdSeconds: TimeInterval = 60
+    /// While the user stays idle, re-check at this cadence so the toast closes shortly after they
+    /// return and become active again.
+    private static let idleRecheckSeconds: TimeInterval = 5
 
     /// Active toast singleton — when a new toast arrives we replace the old one rather than
     /// stacking. Keeps the alert footprint to a single chip in the corner.
     private static var current: ToastWindow?
 
-    static func show(title: String, message: String, accent: NSColor = Theme.accentPeach) {
+    static func show(
+        title: String,
+        message: String,
+        accent: NSColor = Theme.accentPeach,
+        activeDismissSeconds: TimeInterval = 6
+    ) {
         current?.close()
         let toast = ToastWindow(title: title, message: message, accent: accent)
         toast.present()
+        toast.scheduleAutoDismiss(after: activeDismissSeconds)
         current = toast
     }
 
@@ -28,9 +44,32 @@ final class ToastWindow {
         current = nil
     }
 
+    /// Seconds since the last keyboard/mouse input across the whole session. Wide-event idle clock
+    /// (`~0` = any input type). No entitlement required.
+    private static func userIdleSeconds() -> TimeInterval {
+        guard let anyEvent = CGEventType(rawValue: ~0) else { return 0 }
+        return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyEvent)
+    }
+
+    /// Close once the user is active (has seen it). While idle, reschedule rather than close.
+    private func scheduleAutoDismiss(after seconds: TimeInterval) {
+        guard seconds > 0 else { return }
+        dismissWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if Self.userIdleSeconds() < Self.idleThresholdSeconds {
+                close()
+            } else {
+                scheduleAutoDismiss(after: Self.idleRecheckSeconds)
+            }
+        }
+        dismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
     private init(title: String, message: String, accent: NSColor) {
-        let width: CGFloat = 340
-        let height: CGFloat = 94
+        let width: CGFloat = 560
+        let height: CGFloat = 88
         panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -70,6 +109,8 @@ final class ToastWindow {
     }
 
     private func close() {
+        dismissWork?.cancel()
+        dismissWork = nil
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.15
             panel.animator().alphaValue = 0
@@ -103,10 +144,11 @@ private final class ToastContentView: NSView {
             Theme.glowAttributedTitle(title, color: accent, font: Theme.titleFont(size: 13)))
         titleField.translatesAutoresizingMaskIntoConstraints = false
 
-        let messageField = NSTextField(wrappingLabelWithString: message)
+        let messageField = NSTextField(labelWithString: message)
         messageField.font = Theme.bodyFont(size: 11)
         messageField.textColor = Theme.textPrimary
-        messageField.maximumNumberOfLines = 3
+        messageField.maximumNumberOfLines = 1
+        messageField.lineBreakMode = .byTruncatingTail
         messageField.translatesAutoresizingMaskIntoConstraints = false
 
         let closeButton = NSButton()

@@ -20,6 +20,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let toastThresholdField = NSTextField()
     private let toastSustainedField = NSTextField()
     private let toastPeakAlertSwitch = NSSwitch()
+    private let toastPeakMinimumField = NSTextField()
     private let launchAtLoginSwitch = NSSwitch()
     private let toastPreviewButton = NSButton(title: "Preview", target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
@@ -349,6 +350,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
         toastPeakAlertSwitch.translatesAutoresizingMaskIntoConstraints = false
 
+        toastPeakMinimumField.translatesAutoresizingMaskIntoConstraints = false
+        toastPeakMinimumField.placeholderString = "5.00"
+        toastPeakMinimumField.alignment = .right
+
         toastPreviewButton.bezelStyle = .rounded
         toastPreviewButton.controlSize = .small
         toastPreviewButton.target = self
@@ -365,6 +370,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
                 control: toastPeakAlertSwitch,
                 hint: "fires when an OAuth sample beats today's prior max $/hr"
             ),
+            inlineRow("Peak floor ($/hr)", control: toastPeakMinimumField, hint: "ignore peaks below this"),
             inlineRow("Preview", control: toastPreviewButton, hint: "fires a sample toast now")
         ])
         stack.orientation = .vertical
@@ -549,6 +555,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         toastThresholdField.stringValue = String(format: "%.2f", prefs.toastCostThresholdUSDPerHour)
         toastSustainedField.stringValue = String(Int(prefs.toastSustainedSeconds))
         toastPeakAlertSwitch.state = prefs.toastPeakAlertEnabled ? .on : .off
+        toastPeakMinimumField.stringValue = String(format: "%.2f", prefs.toastPeakMinimumUSDPerHour)
         launchAtLoginSwitch.state = LaunchAtLogin.isEnabled() ? .on : .off
         if let index = ViewMode.allCases.firstIndex(of: prefs.defaultMode) {
             modePopup.selectItem(at: index)
@@ -572,6 +579,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             ?? Preferences.default.toastCostThresholdUSDPerHour
         let toastSustained = Double(toastSustainedField.stringValue)
             ?? Preferences.default.toastSustainedSeconds
+        let toastPeakMinimum = Double(toastPeakMinimumField.stringValue)
+            ?? Preferences.default.toastPeakMinimumUSDPerHour
 
         let wantsLaunchAtLogin = launchAtLoginSwitch.state == .on
         let prefs = Preferences(
@@ -584,6 +593,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             toastCostThresholdUSDPerHour: max(0.1, toastThreshold),
             toastSustainedSeconds: min(max(5, toastSustained), 600),
             toastPeakAlertEnabled: toastPeakAlertSwitch.state == .on,
+            toastPeakMinimumUSDPerHour: max(0, toastPeakMinimum),
             launchAtLoginEnabled: wantsLaunchAtLogin
         )
         PreferencesStore.save(prefs)

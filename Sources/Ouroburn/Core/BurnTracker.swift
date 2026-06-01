@@ -127,6 +127,8 @@ struct ToastEvent: Sendable {
     let firstBreachAt: Date
     /// Today's prior peak delta-derived $/hr — populated only for `dailyPeak` events.
     let previousPeakUSDPerHour: Double?
+    /// Today's cumulative spend at fire time. Stable headline figure — doesn't whipsaw like $/hr.
+    let todayCostUSD: Double
 }
 
 /// Orchestrator: every 60 seconds, reload all transcripts, recompute aggregates for the active
@@ -203,6 +205,7 @@ final class BurnTracker: @unchecked Sendable {
         var toastCostThreshold: Double = 8
         var toastSustainedSeconds: Double = 30
         var toastPeakAlertEnabled: Bool = true
+        var toastPeakMinimumUSDPerHour: Double = 5
         var notificationCooldownSeconds: Double = 600
         /// Highest delta-derived $/hr we've already announced for the current local day. Reset on
         /// day rollover. Prevents repeated peak toasts when the same sample is read multiple times.
@@ -233,6 +236,7 @@ final class BurnTracker: @unchecked Sendable {
             $0.toastCostThreshold = prefs.toastCostThresholdUSDPerHour
             $0.toastSustainedSeconds = prefs.toastSustainedSeconds
             $0.toastPeakAlertEnabled = prefs.toastPeakAlertEnabled
+            $0.toastPeakMinimumUSDPerHour = prefs.toastPeakMinimumUSDPerHour
             $0.notificationCooldownSeconds = prefs.notificationCooldownSeconds
             // Threshold or enabled flag changed — reset the breach tracker so the next breach
             // starts fresh rather than firing on stale state.
@@ -500,7 +504,8 @@ final class BurnTracker: @unchecked Sendable {
                         thresholdUSDPerHour: state.toastCostThreshold,
                         topSession: snapshot.perSession.first,
                         firstBreachAt: firstBreach,
-                        previousPeakUSDPerHour: nil
+                        previousPeakUSDPerHour: nil,
+                        todayCostUSD: state.lastSnapshot?.todayCostUSD ?? 0
                     )
                     return (snapshot, event)
                 }
@@ -642,6 +647,9 @@ final class BurnTracker: @unchecked Sendable {
                 state.lastAnnouncedPeakUSDPerHour = 0
             }
             guard state.toastPeakAlertEnabled else { return nil }
+            // A new daily max must also clear the floor — otherwise a tiny first-of-day blip
+            // ($0.40/hr beating $0.10/hr) would fire a "peak" toast every morning.
+            guard latest.rate >= state.toastPeakMinimumUSDPerHour else { return nil }
             guard latest.rate > priorMaxRate, latest.rate > state.lastAnnouncedPeakUSDPerHour else {
                 return nil
             }
@@ -659,7 +667,8 @@ final class BurnTracker: @unchecked Sendable {
                 thresholdUSDPerHour: priorMaxRate,
                 topSession: live?.perSession.first,
                 firstBreachAt: latest.at,
-                previousPeakUSDPerHour: priorMaxRate
+                previousPeakUSDPerHour: priorMaxRate,
+                todayCostUSD: state.lastSnapshot?.todayCostUSD ?? 0
             )
         }
         if let event {

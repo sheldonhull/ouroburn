@@ -18,6 +18,9 @@ struct Preferences: Sendable {
     /// Toast on every newly-observed peak in today's per-interval OAuth spend delta. Fires
     /// independent of `toastEnabled` so users can run pure peak alerting without a $/hr floor.
     var toastPeakAlertEnabled: Bool
+    /// Floor for peak alerts: a new daily max must also clear this $/hr before firing. Kills
+    /// trivial-blip noise (e.g. a $0.40/hr sample beating an even smaller prior max).
+    var toastPeakMinimumUSDPerHour: Double
     /// Launch the menu-bar app on macOS login via SMAppService.
     var launchAtLoginEnabled: Bool
     static let oauthRefreshMaxMinutes: Double = 15
@@ -32,6 +35,7 @@ struct Preferences: Sendable {
         toastCostThresholdUSDPerHour: 8,
         toastSustainedSeconds: 30,
         toastPeakAlertEnabled: true,
+        toastPeakMinimumUSDPerHour: 5,
         launchAtLoginEnabled: false
     )
 }
@@ -49,6 +53,7 @@ enum PreferencesStore {
         static let toastThreshold = "ouroburn.toastCostThresholdUSDPerHour"
         static let toastSustained = "ouroburn.toastSustainedSeconds"
         static let toastPeakAlertEnabled = "ouroburn.toastPeakAlertEnabled"
+        static let toastPeakMinimum = "ouroburn.toastPeakMinimumUSDPerHour"
         static let launchAtLoginEnabled = "ouroburn.launchAtLoginEnabled"
     }
 
@@ -83,6 +88,9 @@ enum PreferencesStore {
         if defaults.object(forKey: Key.toastPeakAlertEnabled) != nil {
             prefs.toastPeakAlertEnabled = defaults.bool(forKey: Key.toastPeakAlertEnabled)
         }
+        if defaults.object(forKey: Key.toastPeakMinimum) != nil {
+            prefs.toastPeakMinimumUSDPerHour = defaults.double(forKey: Key.toastPeakMinimum)
+        }
         if defaults.object(forKey: Key.launchAtLoginEnabled) != nil {
             prefs.launchAtLoginEnabled = defaults.bool(forKey: Key.launchAtLoginEnabled)
         }
@@ -99,6 +107,7 @@ enum PreferencesStore {
         defaults.set(prefs.toastCostThresholdUSDPerHour, forKey: Key.toastThreshold)
         defaults.set(prefs.toastSustainedSeconds, forKey: Key.toastSustained)
         defaults.set(prefs.toastPeakAlertEnabled, forKey: Key.toastPeakAlertEnabled)
+        defaults.set(prefs.toastPeakMinimumUSDPerHour, forKey: Key.toastPeakMinimum)
         defaults.set(prefs.launchAtLoginEnabled, forKey: Key.launchAtLoginEnabled)
     }
 }

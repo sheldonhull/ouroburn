@@ -48,7 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 notifier?.deliverSpike(
                     currentRate: snapshot.tokensPerMinute,
                     previousRate: snapshot.previousTokensPerMinute,
-                    costPerHour: snapshot.costPerHour
+                    todayCostUSD: snapshot.todayCostUSD
                 )
             }
         }
@@ -64,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tracker.onToast = { event in
             DispatchQueue.main.async {
                 let (title, message, accent): (String, String, NSColor)
+                let today = NumberFormatting.compactDollars(event.todayCostUSD)
                 switch event.kind {
                 case .threshold:
                     title = "Burn rate alert"
@@ -71,21 +72,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if let session = event.topSession, session.tokensPerMinute > 0 {
                         let label = Self.shortenSessionLabel(project: session.projectPath)
                         let rate = NumberFormatting.compactRate(tokensPerMinute: session.tokensPerMinute)
-                        message = "\(NumberFormatting.compactRate(dollarsPerHour: event.costPerHour)) · top: \(label) (\(rate))"
+                        message = "\(today) today · top: \(label) (\(rate))"
                     } else {
-                        message = "Sustained > \(NumberFormatting.compactRate(dollarsPerHour: event.thresholdUSDPerHour)) threshold"
+                        message = "\(today) today · sustained burn"
                     }
                 case .dailyPeak:
                     title = "New daily peak"
                     accent = Theme.accentRed
-                    let prior = event.previousPeakUSDPerHour ?? 0
-                    let nowRate = NumberFormatting.compactRate(dollarsPerHour: event.costPerHour)
-                    let priorRate = NumberFormatting.compactRate(dollarsPerHour: prior)
                     if let session = event.topSession, session.tokensPerMinute > 0 {
                         let label = Self.shortenSessionLabel(project: session.projectPath)
-                        message = "\(nowRate) beats today's prior peak (\(priorRate)) · top: \(label)"
+                        message = "\(today) today · top: \(label)"
                     } else {
-                        message = "\(nowRate) beats today's prior peak (\(priorRate))"
+                        message = "\(today) today"
                     }
                 }
                 ToastWindow.show(title: title, message: message, accent: accent)
