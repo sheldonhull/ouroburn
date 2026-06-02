@@ -21,7 +21,7 @@ final class MetricsViewController: NSViewController {
     private let heartbeatView = OAuthHeartbeatView()
     private let heartbeatStore = BillingSampleStore()
     private let topSessionsView = TopSessionsView()
-    private let sectionDivider = SectionDivider()
+    private let sectionDivider = SectionDivider(title: "Local sessions")
     private let graphView = LineGraphView()
     private let graphSpinner = PaneSpinner(message: "Building timeline…")
     private let listSpinner = PaneSpinner(message: "Parsing transcripts…")
@@ -238,6 +238,16 @@ final class MetricsViewController: NSViewController {
     private func renderTopSessions(snapshot: TrackerSnapshot) {
         let buckets = snapshot.bucketsByMode[.session] ?? []
         topSessionsView.update(buckets: buckets)
+
+        // Summarize the local-transcript data feeding this section: session count + the local
+        // (JSONL) token/cost totals. Distinct from the OAuth-billed figures in the tiles above.
+        let active = buckets.filter(\.isActive).count
+        let tokens = buckets.reduce(0) { $0 + $1.totalTokens }
+        let cost = buckets.reduce(0.0) { $0 + $1.costUSD }
+        let activeSuffix = active > 0 ? " · \(active) active" : ""
+        sectionDivider.update(
+            stat: "\(buckets.count) sessions\(activeSuffix) · \(NumberFormatting.compactTokens(tokens)) tk · \(NumberFormatting.compactDollars(cost))"
+        )
     }
 
     @objc private func segmentChanged(_ sender: NSSegmentedControl) {
@@ -507,25 +517,27 @@ final class MetricsViewController: NSViewController {
         segmented.selectedSegment = 0
         view.addSubview(segmented)
 
-        // Pinned below the section divider — drill-down controls live below the priority panel.
+        // Pinned below the top-5 sessions panel — all of these drill-down controls operate on the
+        // same local-transcript data introduced by the "Local sessions" divider above.
         NSLayoutConstraint.activate([
-            segmented.topAnchor.constraint(equalTo: sectionDivider.bottomAnchor, constant: 10),
+            segmented.topAnchor.constraint(equalTo: topSessionsView.bottomAnchor, constant: 10),
             segmented.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
             segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18)
         ])
     }
 
-    /// Top section: OAuth heartbeat (the most-watched live signal) + iStat-style top-5 sessions
-    /// panel, separated from the drill-down rows by a divider. Both views refresh whenever the
-    /// popover opens so the live region feels near-real-time without paying that cost in the
-    /// background tick.
+    /// Two stacked sections. Top: the OAuth-billed heartbeat (the most-watched live signal).
+    /// Then a labeled "Local sessions" divider, below which everything is derived from local
+    /// transcripts — the top-5 sessions panel, mode selector, timeline, and drill-down rows. Both
+    /// live views refresh whenever the popover opens so the region feels near-real-time without
+    /// paying that cost in the background tick.
     private func configurePriorityPanel() {
         heartbeatView.translatesAutoresizingMaskIntoConstraints = false
         topSessionsView.translatesAutoresizingMaskIntoConstraints = false
         sectionDivider.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(heartbeatView)
-        view.addSubview(topSessionsView)
         view.addSubview(sectionDivider)
+        view.addSubview(topSessionsView)
 
         NSLayoutConstraint.activate([
             heartbeatView.topAnchor.constraint(equalTo: monthTile.bottomAnchor, constant: 14),
@@ -533,15 +545,15 @@ final class MetricsViewController: NSViewController {
             heartbeatView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
             heartbeatView.heightAnchor.constraint(equalToConstant: 170),
 
-            topSessionsView.topAnchor.constraint(equalTo: heartbeatView.bottomAnchor, constant: 8),
-            topSessionsView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
-            topSessionsView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
-            topSessionsView.heightAnchor.constraint(equalToConstant: 130),
-
-            sectionDivider.topAnchor.constraint(equalTo: topSessionsView.bottomAnchor, constant: 8),
+            sectionDivider.topAnchor.constraint(equalTo: heartbeatView.bottomAnchor, constant: 12),
             sectionDivider.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
             sectionDivider.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
-            sectionDivider.heightAnchor.constraint(equalToConstant: 14)
+            sectionDivider.heightAnchor.constraint(equalToConstant: 18),
+
+            topSessionsView.topAnchor.constraint(equalTo: sectionDivider.bottomAnchor, constant: 6),
+            topSessionsView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            topSessionsView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
+            topSessionsView.heightAnchor.constraint(equalToConstant: 130)
         ])
     }
 
@@ -1618,29 +1630,58 @@ private final class TopSessionsRow: NSView {
     }
 }
 
-/// Single horizontal hairline separating the live priority panel from the drill-down rows.
+/// Labeled section header marking where the OAuth-billed panel ends and the local-transcript
+/// (JSONL) views begin. The trailing stat summarizes the local data feeding everything below.
 @MainActor
 private final class SectionDivider: NSView {
     private let line = NSView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let statLabel = NSTextField(labelWithString: "")
 
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
+    init(title: String) {
+        super.init(frame: .zero)
         wantsLayer = true
+
         line.wantsLayer = true
         line.layer?.backgroundColor = Theme.divider.cgColor
         line.translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.stringValue = title.uppercased()
+        titleLabel.font = Theme.bodyFont(size: 10)
+        titleLabel.textColor = Theme.textTertiary
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        statLabel.font = Theme.numericFont(size: 10)
+        statLabel.textColor = Theme.textSecondary
+        statLabel.alignment = .right
+        statLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(titleLabel)
+        addSubview(statLabel)
         addSubview(line)
         NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: topAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+
+            statLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            statLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+            statLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 8),
+
+            line.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
             line.leadingAnchor.constraint(equalTo: leadingAnchor),
             line.trailingAnchor.constraint(equalTo: trailingAnchor),
-            line.centerYAnchor.constraint(equalTo: centerYAnchor),
-            line.heightAnchor.constraint(equalToConstant: 1)
+            line.heightAnchor.constraint(equalToConstant: 1),
+            line.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
     }
 
     @available(*, unavailable)
     required init?(coder _: NSCoder) {
         fatalError("not used")
+    }
+
+    func update(stat: String) {
+        statLabel.stringValue = stat
     }
 }
 
