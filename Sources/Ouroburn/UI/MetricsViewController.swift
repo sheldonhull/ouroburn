@@ -281,15 +281,18 @@ final class MetricsViewController: NSViewController {
             tint: rateColor(rate: median)
         )
 
+        // Cost prefers OAuth midnight-delta (billed truth); tokens stay JSONL since OAuth exposes
+        // no token count.
         todayTile.update(
             tokens: snapshot.todayTokens,
-            costUSD: snapshot.todayCostUSD,
+            costUSD: snapshot.displayTodayCostUSD,
             accent: Theme.accentBlue,
             placeholder: snapshot.stale && snapshot.todayTokens == 0
         )
+        // Cost prefers OAuth week delta (billed truth); tokens stay JSONL.
         weekTile.update(
             tokens: snapshot.weekTokens,
-            costUSD: snapshot.weekCostUSD,
+            costUSD: snapshot.displayWeekCostUSD,
             accent: Theme.accentMint,
             placeholder: snapshot.stale && snapshot.weekTokens == 0
         )

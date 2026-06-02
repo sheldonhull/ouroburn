@@ -9,3 +9,7 @@ paths:
 # Cost-diagnosis
 
 - OAuth-today = delta of MTD samples across local midnight (not raw MTD); compare like-for-like before blaming JSONL aggregation.
+- OAuth windows (today/week) are reset-aware: `BurnTracker.oauthSpend` sums only positive consecutive MTD steps. Negative steps = billing-cycle reset (month rollover → MTD drops to ~$0) or a not-yet-recovered upstream trough; never count them as spend.
+- `extra_used_usd` is month-to-date and resets at the billing boundary. A raw anchor-delta across that boundary yields a phantom negative (the "-$210" artifact). `BillingSampleStore.load` already strips *recovered* troughs; the positive-step guard covers genuine resets + the trailing trough.
+- `$12.34` is a known recurring upstream glitch value (transient trough), not a real reading.
+- Tiles + alerts read `displayTodayCostUSD` / `displayWeekCostUSD` (OAuth delta, JSONL fallback). Tokens stay JSONL (OAuth exposes none).

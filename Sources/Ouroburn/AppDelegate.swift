@@ -48,7 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 notifier?.deliverSpike(
                     currentRate: snapshot.tokensPerMinute,
                     previousRate: snapshot.previousTokensPerMinute,
-                    todayCostUSD: snapshot.todayCostUSD
+                    todayCostUSD: snapshot.displayTodayCostUSD
                 )
             }
         }

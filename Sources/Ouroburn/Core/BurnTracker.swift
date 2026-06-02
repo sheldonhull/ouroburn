@@ -51,6 +51,26 @@ struct TrackerSnapshot: Sendable {
     /// dollar value (rate-limited, unauthorized, transport error, …).
     let billingStatusMessage: String?
 
+    /// OAuth-billed spend for the local day (reset-aware sum of MTD steps since midnight). Nil
+    /// until a usable two-point series exists. Truer than `todayCostUSD` (JSONL list-price
+    /// estimate) because it's what Anthropic actually charged past included quota.
+    let oauthTodayUSD: Double?
+
+    /// OAuth-billed spend for the current week. Same derivation as `oauthTodayUSD`, windowed from
+    /// the start of week. Nil until a usable series exists.
+    let oauthWeekUSD: Double?
+
+    /// Headline "today" spend for tiles + alerts. OAuth delta when available, else the local
+    /// JSONL estimate so the figure never goes blank before sign-in.
+    var displayTodayCostUSD: Double {
+        oauthTodayUSD ?? todayCostUSD
+    }
+
+    /// Headline "week" spend. OAuth delta when available, else the JSONL estimate.
+    var displayWeekCostUSD: Double {
+        oauthWeekUSD ?? weekCostUSD
+    }
+
     var buckets: [AggregateBucket] {
         bucketsByMode[mode] ?? []
     }
@@ -67,7 +87,12 @@ struct TrackerSnapshot: Sendable {
         buckets.reduce(0.0) { $0 + $1.costUSD }
     }
 
-    func with(billedMonthUSD: Double?, billingStatusMessage: String? = nil) -> TrackerSnapshot {
+    func with(
+        billedMonthUSD: Double?,
+        billingStatusMessage: String? = nil,
+        oauthTodayUSD: Double?? = nil,
+        oauthWeekUSD: Double?? = nil
+    ) -> TrackerSnapshot {
         TrackerSnapshot(
             mode: mode,
             bucketsByMode: bucketsByMode,
@@ -86,7 +111,9 @@ struct TrackerSnapshot: Sendable {
             spikeDetected: spikeDetected,
             stale: stale,
             billedMonthUSD: billedMonthUSD,
-            billingStatusMessage: billingStatusMessage
+            billingStatusMessage: billingStatusMessage,
+            oauthTodayUSD: oauthTodayUSD ?? self.oauthTodayUSD,
+            oauthWeekUSD: oauthWeekUSD ?? self.oauthWeekUSD
         )
     }
 }
@@ -127,7 +154,8 @@ struct ToastEvent: Sendable {
     let firstBreachAt: Date
     /// Today's prior peak delta-derived $/hr — populated only for `dailyPeak` events.
     let previousPeakUSDPerHour: Double?
-    /// Today's cumulative spend at fire time. Stable headline figure — doesn't whipsaw like $/hr.
+    /// Today's spend at fire time — OAuth midnight-delta when available, else JSONL estimate.
+    /// Stable headline figure that doesn't whipsaw like $/hr.
     let todayCostUSD: Double
 }
 
@@ -318,7 +346,10 @@ final class BurnTracker: @unchecked Sendable {
             // instead of forcing the popover into a "loading…" state on every relaunch.
             stale: Date().timeIntervalSince(cached.savedAt) > Self.pollInterval * 2,
             billedMonthUSD: cached.billedMonthUSD,
-            billingStatusMessage: nil
+            billingStatusMessage: nil,
+            // Recomputed from the billing sample series on the next poll/fetch; not persisted.
+            oauthTodayUSD: nil,
+            oauthWeekUSD: nil
         )
         state.withLock {
             $0.lastSnapshot = snapshot
@@ -505,7 +536,7 @@ final class BurnTracker: @unchecked Sendable {
                         topSession: snapshot.perSession.first,
                         firstBreachAt: firstBreach,
                         previousPeakUSDPerHour: nil,
-                        todayCostUSD: state.lastSnapshot?.todayCostUSD ?? 0
+                        todayCostUSD: state.lastSnapshot?.displayTodayCostUSD ?? 0
                     )
                     return (snapshot, event)
                 }
@@ -589,11 +620,22 @@ final class BurnTracker: @unchecked Sendable {
             let status = await billingService.currentStatusMessage()
             let health = await billingService.currentHealth()
             guard let self else { return }
+            // currentMonthBilledUSD just appended a fresh sample; recompute the OAuth deltas off
+            // the updated series so the headline reflects the latest billed truth immediately.
+            let now = Date()
+            let billingSamples = sampleStore.load()
+            let oauthToday = Self.oauthTodayUSD(samples: billingSamples, now: now, calendar: .current)
+            let oauthWeek = Self.oauthWeekUSD(samples: billingSamples, now: now, calendar: .current)
             let updated = state.withLock { state -> TrackerSnapshot? in
                 state.billedMonthUSD = total
                 state.billingStatusMessage = status
                 guard let last = state.lastSnapshot else { return nil }
-                let next = last.with(billedMonthUSD: total, billingStatusMessage: status)
+                let next = last.with(
+                    billedMonthUSD: total,
+                    billingStatusMessage: status,
+                    oauthTodayUSD: .some(oauthToday),
+                    oauthWeekUSD: .some(oauthWeek)
+                )
                 state.lastSnapshot = next
                 return next
             }
@@ -601,6 +643,47 @@ final class BurnTracker: @unchecked Sendable {
             onBillingHealth?(health)
             checkDailyPeak()
         }
+    }
+
+    /// Spend over `[since, now]` derived from the OAuth `extra_used_usd` month-to-date series.
+    /// Sums only the positive step between consecutive samples, so a billing-cycle reset (MTD
+    /// collapses to ~0 at the month boundary) or a transient upstream trough contributes nothing
+    /// instead of a spurious negative — the post-reset climb is still captured by the steps after
+    /// it. Anchored on the last sample before `since` so spend that landed right at the boundary
+    /// isn't dropped. (`BillingSampleStore.load` already strips recovered troughs; this guard
+    /// covers genuine resets and any trailing, not-yet-recovered trough.)
+    ///
+    /// Returns nil when no two-point delta is computable so callers fall back to the JSONL
+    /// estimate instead of showing a misleading $0.
+    static func oauthSpend(samples: [BillingSample], since: Date, now: Date) -> Double? {
+        let sorted = samples.sorted { $0.timestamp < $1.timestamp }
+        var window = sorted.filter { $0.timestamp >= since && $0.timestamp <= now }
+        if let anchor = sorted.last(where: { $0.timestamp < since }) {
+            window.insert(anchor, at: 0)
+        }
+        guard window.count >= 2 else { return nil }
+        var total = 0.0
+        for i in 1 ..< window.count {
+            let step = window[i].totalUSD - window[i - 1].totalUSD
+            if step > 0 { total += step }
+        }
+        return total
+    }
+
+    /// OAuth-billed spend since local midnight.
+    static func oauthTodayUSD(samples: [BillingSample], now: Date, calendar: Calendar) -> Double? {
+        oauthSpend(samples: samples, since: calendar.startOfDay(for: now), now: now)
+    }
+
+    /// OAuth-billed spend since the start of the current week (Sunday — matches the JSONL week
+    /// bucket lookup, `weekStart: 1`).
+    static func oauthWeekUSD(samples: [BillingSample], now: Date, calendar: Calendar) -> Double? {
+        var cal = calendar
+        cal.firstWeekday = 1
+        let weekday = cal.component(.weekday, from: now)
+        let offset = (weekday - cal.firstWeekday + 7) % 7
+        let weekStart = cal.date(byAdding: .day, value: -offset, to: cal.startOfDay(for: now)) ?? now
+        return oauthSpend(samples: samples, since: weekStart, now: now)
     }
 
     /// Inspect today's OAuth billing samples for a new local peak in per-interval $/hr. Fires
@@ -668,7 +751,7 @@ final class BurnTracker: @unchecked Sendable {
                 topSession: live?.perSession.first,
                 firstBreachAt: latest.at,
                 previousPeakUSDPerHour: priorMaxRate,
-                todayCostUSD: state.lastSnapshot?.todayCostUSD ?? 0
+                todayCostUSD: state.lastSnapshot?.displayTodayCostUSD ?? 0
             )
         }
         if let event {
@@ -919,6 +1002,9 @@ final class BurnTracker: @unchecked Sendable {
         let (billedSoFar, billingStatusSoFar) = state.withLock {
             ($0.billedMonthUSD, $0.billingStatusMessage)
         }
+        let billingSamples = sampleStore.load()
+        let oauthToday = Self.oauthTodayUSD(samples: billingSamples, now: now, calendar: .current)
+        let oauthWeek = Self.oauthWeekUSD(samples: billingSamples, now: now, calendar: .current)
         let snapshot = TrackerSnapshot(
             mode: mode,
             bucketsByMode: bucketsByMode,
@@ -937,7 +1023,9 @@ final class BurnTracker: @unchecked Sendable {
             spikeDetected: spike,
             stale: false,
             billedMonthUSD: billedSoFar,
-            billingStatusMessage: billingStatusSoFar
+            billingStatusMessage: billingStatusSoFar,
+            oauthTodayUSD: oauthToday,
+            oauthWeekUSD: oauthWeek
         )
 
         state.withLock {

@@ -59,7 +59,12 @@ final class OAuthHeartbeatView: NSView {
             let prev = samples[i - 1]
             let curr = samples[i]
             guard curr.timestamp >= todayStart else { continue }
-            raw.append((curr.timestamp, curr.totalUSD - prev.totalUSD, curr.totalUSD))
+            // Clamp the per-beat delta at 0: a billing-cycle reset (month rollover → MTD drops to
+            // ~$0) or a not-yet-recovered upstream trough would otherwise paint a phantom negative
+            // spike (the "-$210" artifact). The cumulative `mtd` line keeps the true value so a
+            // genuine reset still reads as a return to baseline.
+            let delta = max(0, curr.totalUSD - prev.totalUSD)
+            raw.append((curr.timestamp, delta, curr.totalUSD))
         }
         // Centred 3-tap moving average; endpoints unmodified so the latest beat stays sharp.
         var beats: [Beat] = []
