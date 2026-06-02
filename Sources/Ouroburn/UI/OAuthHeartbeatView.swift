@@ -1,17 +1,34 @@
 import AppKit
 
-/// Sparkline of today's OAuth billing deltas. Filters samples to the local day, smooths
-/// neighbours, and renders a Catmull-Rom curve with a hover tooltip.
+/// Sparkline of OAuth billing spend over a selectable range. Buckets the month-to-date sample
+/// series into hourly (today), weekly (this month), or daily (this month) reset-aware spend, then
+/// renders a Catmull-Rom curve with a hover tooltip. The active range follows whichever hero tile
+/// the cursor is over; it defaults to the month.
 @MainActor
 final class OAuthHeartbeatView: NSView {
+    enum Range {
+        case today, week, month
+
+        var title: String {
+            switch self {
+            case .today: "Today"
+            case .week: "This week"
+            case .month: "This month"
+            }
+        }
+    }
+
     fileprivate struct Beat {
         let timestamp: Date
         let dollars: Double
         let smoothed: Double
         let mtd: Double
+        /// Pre-formatted bucket span for the tooltip (e.g. "14:00–15:00", "Jun 3").
+        let label: String
     }
 
-    private var samples: [BillingSample] = []
+    private var allSamples: [BillingSample] = []
+    private var range: Range = .month
     private var beats: [Beat] = []
 
     private let titleLabel = NSTextField(labelWithString: "")
@@ -33,56 +50,123 @@ final class OAuthHeartbeatView: NSView {
     }
 
     func update(samples raw: [BillingSample]) {
-        let sorted = raw.sorted { $0.timestamp < $1.timestamp }
-        let calendar = Calendar.current
-        let dayStart = calendar.startOfDay(for: Date())
-        // Keep one pre-midnight anchor so the first today-delta has a real baseline.
-        let firstTodayIdx = sorted.firstIndex { $0.timestamp >= dayStart }
-        let scoped: [BillingSample] = if let firstTodayIdx, firstTodayIdx > 0 {
-            Array(sorted[(firstTodayIdx - 1)...])
-        } else if let firstTodayIdx {
-            Array(sorted[firstTodayIdx...])
-        } else {
-            []
-        }
-        samples = scoped
-        beats = Self.computeBeats(samples: samples, todayStart: dayStart)
+        allSamples = raw.sorted { $0.timestamp < $1.timestamp }
+        rebuild()
+    }
+
+    /// Switch the displayed range (driven by hero-tile hover). No-op when unchanged.
+    func setRange(_ next: Range) {
+        guard next != range else { return }
+        range = next
+        rebuild()
+    }
+
+    private func rebuild() {
+        beats = Self.buildBeats(samples: allSamples, range: range, now: Date(), calendar: .current)
         canvas.update(beats: beats)
         renderHeader()
     }
 
-    private static func computeBeats(samples: [BillingSample], todayStart: Date) -> [Beat] {
-        guard samples.count >= 2 else { return [] }
-        var raw: [(Date, Double, Double)] = []
-        raw.reserveCapacity(samples.count - 1)
-        for i in 1 ..< samples.count {
-            let prev = samples[i - 1]
-            let curr = samples[i]
-            guard curr.timestamp >= todayStart else { continue }
-            // Clamp the per-beat delta at 0: a billing-cycle reset (month rollover → MTD drops to
-            // ~$0) or a not-yet-recovered upstream trough would otherwise paint a phantom negative
-            // spike (the "-$210" artifact). The cumulative `mtd` line keeps the true value so a
-            // genuine reset still reads as a return to baseline.
-            let delta = max(0, curr.totalUSD - prev.totalUSD)
-            raw.append((curr.timestamp, delta, curr.totalUSD))
+    /// One beat per time bucket, each carrying that bucket's reset-aware OAuth spend. Bucketing:
+    /// hourly across today, weekly across the current month, or one bar per day of the month.
+    private static func buildBeats(
+        samples: [BillingSample],
+        range: Range,
+        now: Date,
+        calendar: Calendar
+    ) -> [Beat] {
+        let buckets = Self.buckets(for: range, now: now, calendar: calendar)
+        var raw: [(date: Date, spend: Double, label: String)] = []
+        raw.reserveCapacity(buckets.count)
+        for bucket in buckets {
+            guard bucket.start <= now else { break } // skip future buckets
+            // `oauthSpend` is reset-aware (skips the negative step a billing-cycle rollover or a
+            // transient trough produces), so per-bucket spend never goes negative.
+            let spend = BurnTracker.oauthSpend(
+                samples: samples,
+                since: bucket.start,
+                now: min(bucket.end, now)
+            ) ?? 0
+            raw.append((bucket.start, spend, bucket.label))
         }
-        // Centred 3-tap moving average; endpoints unmodified so the latest beat stays sharp.
+        // Centred 3-tap moving average for a smooth curve; endpoints unmodified. `mtd` carries the
+        // running cumulative across the range so the tooltip can show spend-to-here.
         var beats: [Beat] = []
         beats.reserveCapacity(raw.count)
+        var cumulative = 0.0
         for (i, point) in raw.enumerated() {
+            cumulative += point.spend
             let smoothed: Double = if i == 0 || i == raw.count - 1 {
-                point.1
+                point.spend
             } else {
-                (raw[i - 1].1 + point.1 + raw[i + 1].1) / 3
+                (raw[i - 1].spend + point.spend + raw[i + 1].spend) / 3
             }
-            beats.append(Beat(timestamp: point.0, dollars: point.1, smoothed: smoothed, mtd: point.2))
+            beats.append(Beat(
+                timestamp: point.date,
+                dollars: point.spend,
+                smoothed: smoothed,
+                mtd: cumulative,
+                label: point.label
+            ))
         }
         return beats
     }
 
+    /// `(start, end, label)` buckets for the range. Today → 24 hourly; month → one per day of the
+    /// current month; week → one bar per week overlapping the current month (Sunday-aligned).
+    private static func buckets(
+        for range: Range,
+        now: Date,
+        calendar: Calendar
+    ) -> [(start: Date, end: Date, label: String)] {
+        var cal = calendar
+        cal.firstWeekday = 1
+        let fmt = DateFormatter()
+        switch range {
+        case .today:
+            let dayStart = cal.startOfDay(for: now)
+            fmt.dateFormat = "HH:mm"
+            return (0 ..< 24).compactMap { hour in
+                guard let start = cal.date(byAdding: .hour, value: hour, to: dayStart),
+                      let end = cal.date(byAdding: .hour, value: 1, to: start) else { return nil }
+                return (start, end, "\(fmt.string(from: start))–\(fmt.string(from: end))")
+            }
+        case .month:
+            guard let monthStart = cal.date(from: cal.dateComponents([.year, .month], from: now)),
+                  let range = cal.range(of: .day, in: .month, for: now) else { return [] }
+            fmt.dateFormat = "MMM d"
+            return range.compactMap { day in
+                guard let start = cal.date(byAdding: .day, value: day - 1, to: monthStart),
+                      let end = cal.date(byAdding: .day, value: 1, to: start) else { return nil }
+                return (start, end, fmt.string(from: start))
+            }
+        case .week:
+            guard let monthStart = cal.date(from: cal.dateComponents([.year, .month], from: now)),
+                  let monthEnd = cal.date(byAdding: .month, value: 1, to: monthStart) else { return [] }
+            fmt.dateFormat = "MMM d"
+            // Start on the Sunday on/before the 1st so the first week's partial days are included.
+            let firstWeekStart = cal.date(
+                byAdding: .day,
+                value: -((cal.component(.weekday, from: monthStart) - cal.firstWeekday + 7) % 7),
+                to: monthStart
+            ) ?? monthStart
+            var out: [(start: Date, end: Date, label: String)] = []
+            var weekStart = firstWeekStart
+            while weekStart < monthEnd {
+                guard let weekEnd = cal.date(byAdding: .day, value: 7, to: weekStart) else { break }
+                // Clamp to the month so the first/last bars only count in-month spend.
+                let start = max(weekStart, monthStart)
+                let end = min(weekEnd, monthEnd)
+                out.append((start, end, "wk \(fmt.string(from: start))"))
+                weekStart = weekEnd
+            }
+            return out
+        }
+    }
+
     private func renderHeader() {
         titleLabel.attributedStringValue = Theme.glowAttributedTitle(
-            "OAuth billing",
+            "OAuth billing · \(range.title)",
             color: Theme.accentMint,
             font: Theme.titleFont(size: 12)
         )
@@ -405,12 +489,10 @@ private final class HeartbeatTooltip: NSView {
     }
 
     func update(beat: OAuthHeartbeatView.Beat, accent: NSColor) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d · HH:mm:ss"
-        timeLabel.stringValue = formatter.string(from: beat.timestamp)
-        deltaLabel.stringValue = "Δ \(NumberFormatting.compactDollars(beat.dollars))"
+        timeLabel.stringValue = beat.label
+        deltaLabel.stringValue = NumberFormatting.compactDollars(beat.dollars)
         deltaLabel.textColor = accent
-        mtdLabel.stringValue = "MTD \(NumberFormatting.compactDollars(beat.mtd))"
+        mtdLabel.stringValue = "Σ \(NumberFormatting.compactDollars(beat.mtd))"
     }
 }
 

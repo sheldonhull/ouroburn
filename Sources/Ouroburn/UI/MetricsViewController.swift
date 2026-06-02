@@ -437,6 +437,14 @@ final class MetricsViewController: NSViewController {
         monthTile.onClick = { [weak self] in self?.onMonthlyTileClick?() }
         monthTile.toolTip = "Click for sample-by-sample Anthropic spend history"
 
+        // Hover a tile to scope the OAuth graph to that range; leaving reverts to the month
+        // default. Each tile reverts to `.month` on exit — moving between tiles fires the next
+        // tile's enter immediately after, so the month default only sticks once the cursor leaves
+        // the whole row.
+        todayTile.onHover = { [weak self] inside in self?.heartbeatView.setRange(inside ? .today : .month) }
+        weekTile.onHover = { [weak self] inside in self?.heartbeatView.setRange(inside ? .week : .month) }
+        monthTile.onHover = { [weak self] _ in self?.heartbeatView.setRange(.month) }
+
         let rateStack = NSStackView(views: [headlineRate, headlineSubrate])
         rateStack.orientation = .vertical
         rateStack.alignment = .leading
@@ -930,12 +938,15 @@ private final class IndentedContainer: NSView {
 @MainActor
 final class StatTile: NSView {
     var onClick: (() -> Void)?
+    /// Fires `true` on mouse-enter, `false` on exit. Drives the OAuth graph's range selection.
+    var onHover: ((Bool) -> Void)?
 
     private let title: NSTextField
     private let cost = NSTextField(labelWithString: "—")
     private let tokens = NSTextField(labelWithString: "—")
     private let symbolView = NSImageView()
     private let symbolName: String
+    private var hoverTracking: NSTrackingArea?
 
     init(title: String, symbol: String) {
         self.title = NSTextField(labelWithString: title.uppercased())
@@ -959,6 +970,27 @@ final class StatTile: NSView {
 
     @objc private func handleClick() {
         onClick?()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTracking = area
+    }
+
+    override func mouseEntered(with _: NSEvent) {
+        onHover?(true)
+    }
+
+    override func mouseExited(with _: NSEvent) {
+        onHover?(false)
     }
 
     func update(tokens tokenCount: Int, costUSD: Double, accent: NSColor, placeholder: Bool = false) {
