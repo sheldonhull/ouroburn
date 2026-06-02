@@ -202,11 +202,7 @@ enum PricingResolver {
         for prefix in PricingService.prefixCandidates {
             if let hit = table[prefix + model] { return hit }
         }
-        let lower = model.lowercased()
-        return table.first { entry in
-            let key = entry.key.lowercased()
-            return key.contains(lower) || lower.contains(key)
-        }?.value
+        return PricingService.fuzzyMatch(model, in: table)
     }
 }
 

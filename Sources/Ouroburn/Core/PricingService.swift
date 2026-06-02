@@ -13,8 +13,13 @@ struct ModelPricing: Sendable, Equatable {
 
 actor PricingService {
     static let feedURL = URL(string: "https://models.dev/api.json")!
-    static let prefixCandidates = ["", "anthropic/", "openai/", "google/", "openrouter/"]
-    static let cacheTTL: TimeInterval = 7 * 24 * 60 * 60
+    /// `anthropic/` is tried before the bare id so a provider-qualified Claude entry wins over a
+    /// colliding bare-id entry from another provider (models.dev exposes e.g. `venice/...` at
+    /// inflated rates; `decode` stores the bare id last-writer-wins).
+    static let prefixCandidates = ["anthropic/", "", "openai/", "google/", "openrouter/"]
+    /// 1 day. Short enough that newly released models (e.g. a fresh Opus) pick up real pricing
+    /// quickly instead of falling through to the fuzzy matcher for a week.
+    static let cacheTTL: TimeInterval = 24 * 60 * 60
 
     private let cacheURL: URL
     private let session: URLSession
@@ -85,14 +90,33 @@ actor PricingService {
         for prefix in Self.prefixCandidates {
             if let hit = table[prefix + name] { return hit }
         }
+        return Self.fuzzyMatch(name, in: table)
+    }
+
+    /// Fuzzy fallback that never DOWNGRADES a newer model to an older one's rate. Accepts only
+    /// keys whose bare id equals the query or extends it (a variant suffix like `-thinking`);
+    /// rejects keys that are a prefix of the query — `claude-opus-4` for `claude-opus-4-8` is
+    /// exactly the match that silently applied 3x-too-high legacy pricing. Among matches it
+    /// prefers an exact id, then an `anthropic/` entry, then the shortest key.
+    static func fuzzyMatch(_ name: String, in table: [String: ModelPricing]) -> ModelPricing? {
         let lower = name.lowercased()
-        if let hit = table.first(where: {
-            let key = $0.key.lowercased()
-            return key.contains(lower) || lower.contains(key)
-        }) {
-            return hit.value
+        func bareId(_ key: String) -> String {
+            key.lowercased().split(separator: "/").last.map(String.init) ?? key.lowercased()
         }
-        return nil
+        let matches = table.filter {
+            let bare = bareId($0.key)
+            return bare == lower || bare.hasPrefix(lower)
+        }
+        let best = matches.min { a, b in
+            let aExact = bareId(a.key) == lower
+            let bExact = bareId(b.key) == lower
+            if aExact != bExact { return aExact }
+            let aAnth = a.key.lowercased().hasPrefix("anthropic/")
+            let bAnth = b.key.lowercased().hasPrefix("anthropic/")
+            if aAnth != bAnth { return aAnth }
+            return a.key.count < b.key.count
+        }
+        return best?.value
     }
 
     static func decode(feed data: Data) -> [String: ModelPricing] {

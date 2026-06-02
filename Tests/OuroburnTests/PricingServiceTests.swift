@@ -89,6 +89,42 @@ struct PricingServiceTests {
         #expect(PricingResolver.resolve(model: "gpt-9000", table: [:]) == nil)
     }
 
+    /// Regression: a newer model must never resolve to an older one's (higher) rate. Before the
+    /// fuzzy matcher was hardened, `claude-opus-4-8` matched `claude-opus-4` and billed 3x.
+    @Test func resolverNeverDowngradesToOlderModel() {
+        let legacy = ModelPricing(
+            inputCostPerToken: 0.000015, outputCostPerToken: 0.000075,
+            cacheCreationCostPerToken: 0.00001875, cacheReadCostPerToken: 0.0000015
+        )
+        let current = ModelPricing(
+            inputCostPerToken: 0.000005, outputCostPerToken: 0.000025,
+            cacheCreationCostPerToken: 0.00000625, cacheReadCostPerToken: 0.0000005
+        )
+        let venice = ModelPricing(
+            inputCostPerToken: 0.000006, outputCostPerToken: 0.000030,
+            cacheCreationCostPerToken: 0.0000075, cacheReadCostPerToken: 0.0000006
+        )
+        let table: [String: ModelPricing] = [
+            "anthropic/claude-opus-4": legacy,
+            "claude-opus-4": legacy,
+            "anthropic/claude-opus-4-8": current,
+            "claude-opus-4-8": venice // bare id is last-writer-wins from a non-anthropic provider
+        ]
+        // Resolves to the anthropic 4-8 rate ($5 in), not legacy 4 ($15) nor venice ($6).
+        #expect(PricingResolver.resolve(model: "claude-opus-4-8", table: table)?.inputCostPerToken == 0.000005)
+    }
+
+    /// When only the older model is in the table, the newer query must miss (cost $0, visibly
+    /// wrong) rather than silently borrow legacy pricing.
+    @Test func resolverMissesRatherThanDowngrade() {
+        let legacy = ModelPricing(
+            inputCostPerToken: 0.000015, outputCostPerToken: 0.000075,
+            cacheCreationCostPerToken: 0, cacheReadCostPerToken: 0
+        )
+        let table: [String: ModelPricing] = ["anthropic/claude-opus-4": legacy]
+        #expect(PricingResolver.resolve(model: "claude-opus-4-8", table: table) == nil)
+    }
+
     @Test func diskCacheRoundTrip() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ouroburn-test-\(UUID().uuidString)")
