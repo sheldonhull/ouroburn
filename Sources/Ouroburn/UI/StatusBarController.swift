@@ -42,6 +42,17 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
         metrics.onModeChange = { [weak tracker] mode in tracker?.setMode(mode) }
         metrics.onLoginClick = { [weak self] in self?.onLoginRequested?() }
         metrics.onMonthlyTileClick = { [weak self] in self?.onShowSpendHistory?() }
+        tracker.onPricingStatus = { [weak metrics] date in
+            DispatchQueue.main.async { metrics?.setPricingAge(date) }
+        }
+        metrics.onRefreshPricingClick = { [weak tracker, weak metrics] in
+            tracker?.refreshPricingManually { date in
+                DispatchQueue.main.async {
+                    metrics?.setPricingAge(date)
+                    metrics?.setPricingRefreshing(false)
+                }
+            }
+        }
         // Keychain access can pop a TCC prompt that blocks indefinitely if the user doesn't
         // notice it (menu-bar app, no front window). Defer the credential probe so app launch
         // isn't gated on Keychain availability. The connection chip starts as `.disconnected`;

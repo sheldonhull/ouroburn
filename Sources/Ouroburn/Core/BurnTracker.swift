@@ -175,6 +175,9 @@ final class BurnTracker: @unchecked Sendable {
     /// Fires after every billing fetch — success or failure — so the popover indicator can
     /// reflect token state without re-polling the billing actor.
     var onBillingHealth: ((BillingHealth) -> Void)?
+    /// Fires after pricing loads or refreshes, carrying the feed's load time so the popover footer
+    /// can show its age. Delivered off the main thread — dispatch before touching UI.
+    var onPricingStatus: ((Date?) -> Void)?
 
     static let pollInterval: TimeInterval = 60
     static let burnWindowSeconds: TimeInterval = 5 * 60
@@ -389,6 +392,7 @@ final class BurnTracker: @unchecked Sendable {
             await pricingService.ensureLoaded()
             let table = await pricingService.currentTable()
             state.withLock { $0.pricingTable = table }
+            await onPricingStatus?(pricingService.lastLoadedAt())
             Log.info(Log.tracker, "Pricing table loaded: \(table.count) models")
             queue.async { [weak self] in self?.poll(trigger: .timer) }
             queue.async { [weak self] in self?.fetchBilling() }
@@ -622,6 +626,21 @@ final class BurnTracker: @unchecked Sendable {
             }
             let table = await pricingService.currentTable()
             state.withLock { $0.pricingTable = table }
+            await onPricingStatus?(pricingService.lastLoadedAt())
+        }
+    }
+
+    /// User-initiated pricing refetch (footer refresh button). Forces a fetch regardless of the
+    /// debounce, swaps in the new table, re-polls so the popover costs recompute immediately, and
+    /// reports the resulting load time. `completion` is delivered off the main thread.
+    func refreshPricingManually(completion: @escaping @Sendable (Date?) -> Void) {
+        Task { [pricingService, state, queue] in
+            let loadedAt = await pricingService.manualRefresh()
+            let table = await pricingService.currentTable()
+            state.withLock { $0.pricingTable = table }
+            onPricingStatus?(loadedAt)
+            queue.async { [weak self] in self?.poll(trigger: .timer) }
+            completion(loadedAt)
         }
     }
 

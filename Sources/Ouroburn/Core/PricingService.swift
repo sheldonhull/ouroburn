@@ -54,6 +54,19 @@ actor PricingService {
         if loadedAt == nil { await load() }
     }
 
+    /// When the in-memory table was last loaded or refreshed (disk-cache age on a cold start).
+    /// Surfaced in the popover footer.
+    func lastLoadedAt() -> Date? {
+        loadedAt
+    }
+
+    /// User-initiated refetch that ignores the debounce. Returns the resulting load time so the
+    /// footer can show the new age (unchanged on failure).
+    func manualRefresh() async -> Date? {
+        await forceRefresh()
+        return loadedAt
+    }
+
     /// Re-fetch from the feed when the in-memory table has aged past the TTL. Cheap no-op
     /// otherwise. Lets a long-running menu-bar process pick up newly published models without a
     /// relaunch — call it from the poll loop.

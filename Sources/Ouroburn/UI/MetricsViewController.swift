@@ -8,6 +8,7 @@ final class MetricsViewController: NSViewController {
     var onModeChange: ((ViewMode) -> Void)?
     var onLoginClick: (() -> Void)?
     var onMonthlyTileClick: (() -> Void)?
+    var onRefreshPricingClick: (() -> Void)?
 
     private let headlineRate = NSTextField(labelWithString: "—")
     private let headlineSubrate = NSTextField(labelWithString: "")
@@ -31,6 +32,10 @@ final class MetricsViewController: NSViewController {
     private let footerLabel = NSTextField(labelWithString: "")
     private let billedTotalLabel = NSTextField(labelWithString: "")
     private let connectionButton = NSButton(title: "Disconnected", target: nil, action: nil)
+    private let pricingAgeLabel = NSTextField(labelWithString: "models.dev —")
+    private let pricingRefreshButton = NSButton()
+    private let pricingSpinner = NSProgressIndicator()
+    private var lastPricingLoadedAt: Date?
 
     private var snapshot: TrackerSnapshot?
     private var lastRenderedMode: ViewMode = .day
@@ -69,6 +74,7 @@ final class MetricsViewController: NSViewController {
         configureGraph()
         configureBody()
         configureFooter()
+        configurePricingStatus()
         configureRefreshBanner()
 
         renderEmptyState()
@@ -211,8 +217,12 @@ final class MetricsViewController: NSViewController {
     func popoverWillShow() {
         guard let snapshot else { return }
         renderHero(snapshot: snapshot)
+        // Reset the OAuth graph to the month default on every open so it's stable and hoverable;
+        // tile hover can still switch ranges from there.
+        heartbeatView.setRange(.month)
         renderHeartbeat()
         renderTopSessions(snapshot: snapshot)
+        setPricingAge(lastPricingLoadedAt) // re-render the relative age as it grows
     }
 
     /// Live tick (~2s while popover open). Overlays the hero USD/hr with the rolling-60s value
@@ -447,13 +457,13 @@ final class MetricsViewController: NSViewController {
         monthTile.onClick = { [weak self] in self?.onMonthlyTileClick?() }
         monthTile.toolTip = "Click for sample-by-sample Anthropic spend history"
 
-        // Hover a tile to scope the OAuth graph to that range; leaving reverts to the month
-        // default. Each tile reverts to `.month` on exit — moving between tiles fires the next
-        // tile's enter immediately after, so the month default only sticks once the cursor leaves
-        // the whole row.
-        todayTile.onHover = { [weak self] inside in self?.heartbeatView.setRange(inside ? .today : .month) }
-        weekTile.onHover = { [weak self] inside in self?.heartbeatView.setRange(inside ? .week : .month) }
-        monthTile.onHover = { [weak self] _ in self?.heartbeatView.setRange(.month) }
+        // Hover a tile to scope the OAuth graph to that range. Only the enter switches — there's
+        // no revert on exit, so moving the cursor off a tile and down onto the graph keeps the
+        // selected range steady enough to hover the bars. The range resets to month on each
+        // popover open (see `popoverWillShow`).
+        todayTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.today) } }
+        weekTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.week) } }
+        monthTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.month) } }
 
         let rateStack = NSStackView(views: [headlineRate, headlineSubrate])
         rateStack.orientation = .vertical
@@ -633,6 +643,78 @@ final class MetricsViewController: NSViewController {
 
             scrollView.bottomAnchor.constraint(equalTo: connectionButton.topAnchor, constant: -8)
         ])
+    }
+
+    /// Footer "models.dev {age}" status + manual refresh button (with spinner), sitting left of
+    /// the connection indicator.
+    private func configurePricingStatus() {
+        pricingAgeLabel.font = Theme.bodyFont(size: 10)
+        pricingAgeLabel.textColor = Theme.textTertiary
+        pricingAgeLabel.toolTip = "Age of the models.dev pricing feed"
+        pricingAgeLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        pricingRefreshButton.isBordered = false
+        pricingRefreshButton.bezelStyle = .smallSquare
+        pricingRefreshButton.imagePosition = .imageOnly
+        pricingRefreshButton.image = NSImage(
+            systemSymbolName: "arrow.clockwise",
+            accessibilityDescription: "Refresh pricing"
+        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
+        pricingRefreshButton.contentTintColor = Theme.textSecondary
+        pricingRefreshButton.toolTip = "Refresh models.dev pricing now"
+        pricingRefreshButton.target = self
+        pricingRefreshButton.action = #selector(pricingRefreshClicked)
+        pricingRefreshButton.translatesAutoresizingMaskIntoConstraints = false
+
+        pricingSpinner.style = .spinning
+        pricingSpinner.controlSize = .small
+        pricingSpinner.isDisplayedWhenStopped = false
+        pricingSpinner.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(pricingAgeLabel)
+        view.addSubview(pricingRefreshButton)
+        view.addSubview(pricingSpinner)
+        NSLayoutConstraint.activate([
+            pricingRefreshButton.centerYAnchor.constraint(equalTo: connectionButton.centerYAnchor),
+            pricingRefreshButton.trailingAnchor.constraint(equalTo: connectionButton.leadingAnchor, constant: -10),
+            pricingRefreshButton.widthAnchor.constraint(equalToConstant: 18),
+            pricingRefreshButton.heightAnchor.constraint(equalToConstant: 18),
+
+            pricingSpinner.centerXAnchor.constraint(equalTo: pricingRefreshButton.centerXAnchor),
+            pricingSpinner.centerYAnchor.constraint(equalTo: pricingRefreshButton.centerYAnchor),
+
+            pricingAgeLabel.centerYAnchor.constraint(equalTo: connectionButton.centerYAnchor),
+            pricingAgeLabel.trailingAnchor.constraint(equalTo: pricingRefreshButton.leadingAnchor, constant: -6)
+        ])
+    }
+
+    @objc private func pricingRefreshClicked() {
+        setPricingRefreshing(true)
+        onRefreshPricingClick?()
+    }
+
+    /// Swap the refresh glyph for a spinner while a manual refetch is in flight.
+    func setPricingRefreshing(_ refreshing: Bool) {
+        pricingRefreshButton.isHidden = refreshing
+        if refreshing { pricingSpinner.startAnimation(nil) } else { pricingSpinner.stopAnimation(nil) }
+    }
+
+    /// Update the "models.dev {age}" label. Caches the date so `popoverWillShow` can re-render the
+    /// relative age as it grows between feed loads.
+    func setPricingAge(_ date: Date?) {
+        lastPricingLoadedAt = date
+        pricingAgeLabel.stringValue = "models.dev \(Self.relativeAge(date))"
+    }
+
+    private static func relativeAge(_ date: Date?) -> String {
+        guard let date else { return "—" }
+        let seconds = Date().timeIntervalSince(date)
+        if seconds < 90 { return "just now" }
+        let minutes = Int(seconds / 60)
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours)h ago" }
+        return "\(hours / 24)d ago"
     }
 
     private func renderRows(_ buckets: [AggregateBucket]) {
