@@ -21,10 +21,15 @@ actor PricingService {
     /// quickly instead of falling through to the fuzzy matcher for a week.
     static let cacheTTL: TimeInterval = 24 * 60 * 60
 
+    /// Floor between forced (unknown-model) refetches so a transcript full of unpriceable model
+    /// names can't hammer the feed.
+    static let forcedRefreshDebounce: TimeInterval = 60 * 60
+
     private let cacheURL: URL
     private let session: URLSession
     private var table: [String: ModelPricing] = [:]
     private var loadedAt: Date?
+    private var lastForcedRefreshAt: Date?
 
     init(cacheURL: URL, session: URLSession = .shared) {
         self.cacheURL = cacheURL
@@ -47,6 +52,36 @@ actor PricingService {
 
     func ensureLoaded() async {
         if loadedAt == nil { await load() }
+    }
+
+    /// Re-fetch from the feed when the in-memory table has aged past the TTL. Cheap no-op
+    /// otherwise. Lets a long-running menu-bar process pick up newly published models without a
+    /// relaunch — call it from the poll loop.
+    func refreshIfStale() async {
+        guard let loadedAt, Date().timeIntervalSince(loadedAt) >= Self.cacheTTL else { return }
+        await forceRefresh()
+    }
+
+    /// Force a re-fetch regardless of TTL, debounced to `forcedRefreshDebounce`. Used when the
+    /// tracker sees a model the current table can't price (a model released since the last fetch).
+    func refreshNow() async {
+        if let last = lastForcedRefreshAt, Date().timeIntervalSince(last) < Self.forcedRefreshDebounce {
+            return
+        }
+        lastForcedRefreshAt = Date()
+        await forceRefresh()
+    }
+
+    private func forceRefresh() async {
+        do {
+            let fresh = try await fetchRemote()
+            table = fresh
+            loadedAt = Date()
+            writeDiskCache(table: fresh, loadedAt: loadedAt!)
+            Log.info(Log.pricing, "Pricing refreshed: \(fresh.count) models")
+        } catch {
+            Log.error(Log.pricing, "Pricing refresh failed: \(error.localizedDescription)")
+        }
     }
 
     private func load() async {

@@ -610,6 +610,21 @@ final class BurnTracker: @unchecked Sendable {
         return LiveSnapshot(updatedAt: now, tokensPerMinute: tpm, costPerHour: cph, perSession: velocities)
     }
 
+    /// Pull newly published pricing into the live table without a relaunch. `refreshIfStale` is a
+    /// cheap no-op until the feed TTL lapses; `refreshNow` forces an immediate (debounced) refetch
+    /// when a model the table can't price shows up. The refreshed table is read by the next poll.
+    private func refreshPricing(forceImmediate: Bool) {
+        Task { [pricingService, state] in
+            if forceImmediate {
+                await pricingService.refreshNow()
+            } else {
+                await pricingService.refreshIfStale()
+            }
+            let table = await pricingService.currentTable()
+            state.withLock { $0.pricingTable = table }
+        }
+    }
+
     /// Async billing fetch decoupled from the session poll. Updates the snapshot in place so the
     /// popover footer / monthly tile reflect upstream `extra_used_usd` independently of the
     /// (much slower) JSONL aggregation cycle.
@@ -958,6 +973,20 @@ final class BurnTracker: @unchecked Sendable {
             Log.tracker,
             "Poll mode=\(mode.rawValue) entries=\(entries.count) cachedFiles=\(updatedCache.count) pricing=\(table.count)"
         )
+
+        // Self-heal pricing without a relaunch. If a transcript references a Claude model the
+        // current table can't price — i.e. one released since the last feed fetch — force an
+        // immediate (debounced) refetch; otherwise refresh only once the table ages past its TTL.
+        // Either way the updated table lands on the next poll. Non-Claude/custom models that
+        // models.dev never prices are ignored so they don't trigger perpetual refetches.
+        var distinctModels = Set<String>()
+        for entry in entries {
+            if let model = entry.model { distinctModels.insert(model) }
+        }
+        let unknownClaudeModel = distinctModels.contains {
+            $0.lowercased().hasPrefix("claude") && PricingResolver.resolve(model: $0, table: table) == nil
+        }
+        refreshPricing(forceImmediate: unknownClaudeModel)
 
         let aggregator = Aggregator(pricing: table)
 
