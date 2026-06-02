@@ -112,55 +112,45 @@ final class OAuthHeartbeatView: NSView {
         return beats
     }
 
-    /// `(start, end, label)` buckets for the range. Today → 24 hourly; month → one per day of the
-    /// current month; week → one bar per week overlapping the current month (Sunday-aligned).
+    /// `(start, end, label)` buckets for the range. Today → 24 hourly bars of the current day;
+    /// week → one bar per day over the trailing 7 days; month → one bar per day over the trailing
+    /// 30 days. Week/month use trailing windows rather than calendar boundaries so the graph still
+    /// shows the OAuth history early in a month (a calendar-month view is a single bar on the 1st).
     private static func buckets(
         for range: Range,
         now: Date,
         calendar: Calendar
     ) -> [(start: Date, end: Date, label: String)] {
-        var cal = calendar
-        cal.firstWeekday = 1
-        let fmt = DateFormatter()
         switch range {
         case .today:
-            let dayStart = cal.startOfDay(for: now)
+            let dayStart = calendar.startOfDay(for: now)
+            let fmt = DateFormatter()
             fmt.dateFormat = "HH:mm"
             return (0 ..< 24).compactMap { hour in
-                guard let start = cal.date(byAdding: .hour, value: hour, to: dayStart),
-                      let end = cal.date(byAdding: .hour, value: 1, to: start) else { return nil }
+                guard let start = calendar.date(byAdding: .hour, value: hour, to: dayStart),
+                      let end = calendar.date(byAdding: .hour, value: 1, to: start) else { return nil }
                 return (start, end, "\(fmt.string(from: start))–\(fmt.string(from: end))")
             }
-        case .month:
-            guard let monthStart = cal.date(from: cal.dateComponents([.year, .month], from: now)),
-                  let range = cal.range(of: .day, in: .month, for: now) else { return [] }
-            fmt.dateFormat = "MMM d"
-            return range.compactMap { day in
-                guard let start = cal.date(byAdding: .day, value: day - 1, to: monthStart),
-                      let end = cal.date(byAdding: .day, value: 1, to: start) else { return nil }
-                return (start, end, fmt.string(from: start))
-            }
         case .week:
-            guard let monthStart = cal.date(from: cal.dateComponents([.year, .month], from: now)),
-                  let monthEnd = cal.date(byAdding: .month, value: 1, to: monthStart) else { return [] }
-            fmt.dateFormat = "MMM d"
-            // Start on the Sunday on/before the 1st so the first week's partial days are included.
-            let firstWeekStart = cal.date(
-                byAdding: .day,
-                value: -((cal.component(.weekday, from: monthStart) - cal.firstWeekday + 7) % 7),
-                to: monthStart
-            ) ?? monthStart
-            var out: [(start: Date, end: Date, label: String)] = []
-            var weekStart = firstWeekStart
-            while weekStart < monthEnd {
-                guard let weekEnd = cal.date(byAdding: .day, value: 7, to: weekStart) else { break }
-                // Clamp to the month so the first/last bars only count in-month spend.
-                let start = max(weekStart, monthStart)
-                let end = min(weekEnd, monthEnd)
-                out.append((start, end, "wk \(fmt.string(from: start))"))
-                weekStart = weekEnd
-            }
-            return out
+            return dailyBuckets(daysBack: 7, now: now, calendar: calendar)
+        case .month:
+            return dailyBuckets(daysBack: 30, now: now, calendar: calendar)
+        }
+    }
+
+    /// Trailing per-day buckets, oldest first, ending with today's partial day.
+    private static func dailyBuckets(
+        daysBack: Int,
+        now: Date,
+        calendar: Calendar
+    ) -> [(start: Date, end: Date, label: String)] {
+        let todayStart = calendar.startOfDay(for: now)
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMM d"
+        return (0 ..< daysBack).reversed().compactMap { back in
+            guard let start = calendar.date(byAdding: .day, value: -back, to: todayStart),
+                  let end = calendar.date(byAdding: .day, value: 1, to: start) else { return nil }
+            return (start, end, fmt.string(from: start))
         }
     }
 
