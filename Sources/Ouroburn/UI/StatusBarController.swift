@@ -72,7 +72,12 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
     }
 
     func render(snapshot: TrackerSnapshot) {
-        iconView.update(liveRate: snapshot.tokensPerMinute, medianRate: snapshot.medianTokensPerMinute)
+        // Spinner reflects OAuth-billed burn only — local JSONL (which a non-billed Teams session
+        // still writes) must not move it. Color ← burn/median, speed ← last sample block.
+        iconView.update(
+            burnUSDPerHour: snapshot.oauthBurnUSDPerHour,
+            medianUSDPerHour: snapshot.oauthMedianBurnUSDPerHour
+        )
         metrics.update(snapshot: snapshot)
         if let button = item.button {
             button.toolTip = "ouroburn — "
@@ -84,10 +89,10 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
 
     func applyLive(snapshot: LiveSnapshot) {
         metrics.applyLive(snapshot: snapshot)
-        // Live tooltip + icon only when there's actual activity in the rolling 60s window.
-        // Idle (rate == 0) defers to the 60s `render(snapshot:)` path so the tooltip doesn't flicker.
+        // The spinner is OAuth-driven (see `render`); live JSONL only refreshes the tooltip text
+        // while the popover is open. Skip when the rolling window is idle so the tooltip doesn't
+        // flicker between live and 60s values.
         guard snapshot.tokensPerMinute > 0 else { return }
-        iconView.update(liveRate: snapshot.tokensPerMinute, medianRate: snapshot.tokensPerMinute)
         if let button = item.button {
             button.toolTip = "ouroburn — "
                 + NumberFormatting.compactRate(tokensPerMinute: snapshot.tokensPerMinute)

@@ -5,7 +5,7 @@ import QuartzCore
 ///
 /// Renders a coiled snake biting its tail using a tapered body (head fat, tail thin), an open
 /// mouth wedge, an eye, and a tail tip clamped in the mouth. Color + rotation speed encode the
-/// burn-rate tier (1...10).
+/// OAuth burn-rate tier (0 = idle green, 1...10 = active green → red).
 ///
 /// Architecture: snake is rasterized to a `CGImage` once per tier (color + size unchanged
 /// between ticks), then a single `CABasicAnimation` on `transform.rotation.z` spins the image
@@ -14,17 +14,21 @@ import QuartzCore
 final class OuroborosView: NSView {
     private let snakeLayer = CALayer()
     private var currentTier: Int = -1
+    private var currentRPS: CGFloat = -1
     private var currentImageSize: CGSize = .zero
 
-    /// Number of tiers mapped onto `liveRate / medianRate`. Tier 1 = baseline (idle slow spin),
-    /// tier 10 = max RPS (max color). Each tier picks a distinct rotation speed AND a distinct
-    /// interpolated color along the idle → warm → hot ramp.
+    /// Active tiers mapped onto `oauthBurn / oauthMedian`. Tier 1 = at/below median (base green
+    /// spin), tier 10 = ≥3× median (max RPS, hot red). Tier 0 is the separate idle state: green,
+    /// slowest spin, shown when no upstream OAuth spend is being sampled.
     static let tierCount = 10
-    static let idleColor = Theme.accentBlue
-    static let warmColor = Theme.accentMint
+    /// No upstream activity / at-median pace. Clear green — "nothing being charged right now".
+    static let idleColor = Theme.accentLime
+    static let warmColor = Theme.accentPeach
     static let hotColor = Theme.accentRed
-    static let baseRPS: CGFloat = 0.10
-    static let maxRPS: CGFloat = 1.50
+    /// Idle spin: alive but barely moving so green reads as "quiet", not "frozen".
+    static let idleRPS: CGFloat = 0.05
+    static let baseRPS: CGFloat = 0.12
+    static let maxRPS: CGFloat = 1.60
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -41,7 +45,8 @@ final class OuroborosView: NSView {
         snakeLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
         layer?.addSublayer(snakeLayer)
 
-        applyTier(1)
+        // Launch idle: green, stopped. The first billing fetch drives real color + spin.
+        apply(tier: 0, rps: 0)
     }
 
     @available(*, unavailable)
@@ -56,47 +61,81 @@ final class OuroborosView: NSView {
         snakeLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
         if bounds.size != currentImageSize {
             // Force a re-rasterize at the new size.
-            let tier = max(1, currentTier)
+            let tier = max(0, currentTier)
             currentTier = -1
-            applyTier(tier)
+            apply(tier: tier, rps: currentRPS < 0 ? 0 : currentRPS)
         }
     }
 
-    /// Map `liveRate / medianRate` onto tiers 1...10. `liveRate <= medianRate` → tier 1.
-    /// `liveRate >= medianRate * 3` → tier 10. Linear in between.
-    func update(liveRate: Double, medianRate: Double) {
-        let safeMedian = max(medianRate, 1)
-        let ratio = max(0, liveRate / safeMedian)
-        let normalized = min(1.0, max(0.0, (ratio - 1.0) / 2.0))
-        let tier = max(1, min(Self.tierCount, 1 + Int(normalized * Double(Self.tierCount - 1) + 0.5)))
-        applyTier(tier)
+    /// Drive the spinner from the OAuth-billed burn rate. Two independent axes, per the design:
+    /// - **Color** tracks `burn / median` — am I above my normal pace? At/below median → green,
+    ///   ramping to red at ≥3× median. This is purely OAuth so a non-billed Teams session (which
+    ///   still writes local JSONL) never tints the snake.
+    /// - **Speed** tracks the magnitude of the last sample block (`burn`). No spend in the last
+    ///   block → the snake spins down to a stop. Faster as the block's $/hr climbs.
+    func update(burnUSDPerHour: Double, medianUSDPerHour: Double) {
+        apply(
+            tier: Self.colorTier(burn: burnUSDPerHour, median: medianUSDPerHour),
+            rps: Self.spinRPS(burn: burnUSDPerHour, median: medianUSDPerHour)
+        )
     }
 
-    private func applyTier(_ tier: Int) {
-        guard tier != currentTier || bounds.size != currentImageSize else { return }
-        currentTier = tier
-        currentImageSize = bounds.size
+    /// Color tier 0...10 from the burn/median ratio. 0 = idle (no spend), 1 = at/below median,
+    /// 10 = ≥3× median. Both 0 and 1 read green; the distinction only matters for callers that
+    /// want the idle image (it's identical green, so they collapse visually).
+    private static func colorTier(burn: Double, median: Double) -> Int {
+        guard burn > 0 else { return 0 }
+        guard median > 0 else { return 1 }
+        let ratio = burn / median
+        let normalized = min(1.0, max(0.0, (ratio - 1.0) / 2.0))
+        return max(1, min(tierCount, 1 + Int(normalized * Double(tierCount - 1) + 0.5)))
+    }
 
-        let t = CGFloat(tier - 1) / CGFloat(max(1, Self.tierCount - 1))
-        let rps = Self.baseRPS + (Self.maxRPS - Self.baseRPS) * t
-        let color = Self.colorFor(tier: tier)
+    /// Spin speed from the last block's magnitude. 0 spend → 0 (stop). Scales linearly to
+    /// `baseRPS` at median pace, then up to `maxRPS` at ≥3× median. Below median it eases toward
+    /// a stop so a quiet block visibly slows the snake.
+    private static func spinRPS(burn: Double, median: Double) -> CGFloat {
+        guard burn > 0 else { return 0 }
+        guard median > 0 else { return baseRPS }
+        let ratio = CGFloat(burn / median)
+        if ratio <= 1 {
+            // Floor at idleRPS so any nonzero spend keeps the snake perceptibly alive.
+            return max(idleRPS, baseRPS * ratio)
+        }
+        let over = min(1.0, (ratio - 1) / 2)
+        return baseRPS + (maxRPS - baseRPS) * over
+    }
 
-        // Render once at the current size + color. Result is cached in the layer's `contents`
-        // until the tier or size changes again.
-        let image = renderSnakeImage(color: color, size: bounds.size)
+    private func apply(tier: Int, rps: CGFloat) {
+        if tier != currentTier || bounds.size != currentImageSize {
+            currentTier = tier
+            currentImageSize = bounds.size
 
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        snakeLayer.contents = image
-        layer?.shadowColor = color.cgColor
-        layer?.shadowRadius = 3 + 5 * t
-        CATransaction.commit()
+            let t = CGFloat(max(0, tier - 1)) / CGFloat(max(1, Self.tierCount - 1))
+            let color = Self.colorFor(tier: tier)
 
-        installRotation(rps: rps)
+            // Render once per color tier. Cached in the layer's `contents` until tier/size changes.
+            let image = renderSnakeImage(color: color, size: bounds.size)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            snakeLayer.contents = image
+            layer?.shadowColor = color.cgColor
+            layer?.shadowRadius = 3 + 5 * t
+            CATransaction.commit()
+        }
+
+        // Speed is independent of color — re-install only when it actually changes so a steady
+        // rate doesn't reset the rotation phase on every billing tick.
+        if abs(rps - currentRPS) > 0.001 {
+            currentRPS = rps
+            installRotation(rps: rps)
+        }
     }
 
     private func installRotation(rps: CGFloat) {
         snakeLayer.removeAnimation(forKey: "spin")
+        // Zero rate → no animation: the snake holds still (green = nothing being charged).
+        guard rps > 0 else { return }
         let rot = CABasicAnimation(keyPath: "transform.rotation.z")
         rot.fromValue = 0
         rot.toValue = -2 * Double.pi

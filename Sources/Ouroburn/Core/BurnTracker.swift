@@ -60,6 +60,15 @@ struct TrackerSnapshot: Sendable {
     /// the start of week. Nil until a usable series exists.
     let oauthWeekUSD: Double?
 
+    /// OAuth-billed burn rate ($/hr) over the trailing window — what drives the menu-bar spinner.
+    /// 0 when no recent positive `extra_used_usd` step (idle). Distinct from JSONL `costPerHour`
+    /// so a non-billed Teams session — which still writes local transcripts — reads as idle here.
+    let oauthBurnUSDPerHour: Double
+
+    /// Median active-interval OAuth burn rate ($/hr) for the current month — the "normal pace"
+    /// baseline the spinner tiers against. Above it → faster/hotter spin; at/below → base green.
+    let oauthMedianBurnUSDPerHour: Double
+
     /// Headline "today" spend for tiles + alerts. OAuth delta when available, else the local
     /// JSONL estimate so the figure never goes blank before sign-in.
     var displayTodayCostUSD: Double {
@@ -91,7 +100,9 @@ struct TrackerSnapshot: Sendable {
         billedMonthUSD: Double?,
         billingStatusMessage: String? = nil,
         oauthTodayUSD: Double?? = nil,
-        oauthWeekUSD: Double?? = nil
+        oauthWeekUSD: Double?? = nil,
+        oauthBurnUSDPerHour: Double? = nil,
+        oauthMedianBurnUSDPerHour: Double? = nil
     ) -> TrackerSnapshot {
         TrackerSnapshot(
             mode: mode,
@@ -113,7 +124,9 @@ struct TrackerSnapshot: Sendable {
             billedMonthUSD: billedMonthUSD,
             billingStatusMessage: billingStatusMessage,
             oauthTodayUSD: oauthTodayUSD ?? self.oauthTodayUSD,
-            oauthWeekUSD: oauthWeekUSD ?? self.oauthWeekUSD
+            oauthWeekUSD: oauthWeekUSD ?? self.oauthWeekUSD,
+            oauthBurnUSDPerHour: oauthBurnUSDPerHour ?? self.oauthBurnUSDPerHour,
+            oauthMedianBurnUSDPerHour: oauthMedianBurnUSDPerHour ?? self.oauthMedianBurnUSDPerHour
         )
     }
 }
@@ -352,7 +365,10 @@ final class BurnTracker: @unchecked Sendable {
             billingStatusMessage: nil,
             // Recomputed from the billing sample series on the next poll/fetch; not persisted.
             oauthTodayUSD: nil,
-            oauthWeekUSD: nil
+            oauthWeekUSD: nil,
+            // Idle (green spinner) until the first billing fetch derives a rate from the series.
+            oauthBurnUSDPerHour: 0,
+            oauthMedianBurnUSDPerHour: 0
         )
         state.withLock {
             $0.lastSnapshot = snapshot
@@ -660,6 +676,7 @@ final class BurnTracker: @unchecked Sendable {
             let billingSamples = sampleStore.load()
             let oauthToday = Self.oauthTodayUSD(samples: billingSamples, now: now, calendar: .current)
             let oauthWeek = Self.oauthWeekUSD(samples: billingSamples, now: now, calendar: .current)
+            let burn = Self.oauthBurnRates(samples: billingSamples, now: now, calendar: .current)
             let updated = state.withLock { state -> TrackerSnapshot? in
                 state.billedMonthUSD = total
                 state.billingStatusMessage = status
@@ -668,7 +685,9 @@ final class BurnTracker: @unchecked Sendable {
                     billedMonthUSD: total,
                     billingStatusMessage: status,
                     oauthTodayUSD: .some(oauthToday),
-                    oauthWeekUSD: .some(oauthWeek)
+                    oauthWeekUSD: .some(oauthWeek),
+                    oauthBurnUSDPerHour: burn.current,
+                    oauthMedianBurnUSDPerHour: burn.median
                 )
                 state.lastSnapshot = next
                 return next
@@ -718,6 +737,53 @@ final class BurnTracker: @unchecked Sendable {
         let offset = (weekday - cal.firstWeekday + 7) % 7
         let weekStart = cal.date(byAdding: .day, value: -offset, to: cal.startOfDay(for: now)) ?? now
         return oauthSpend(samples: samples, since: weekStart, now: now)
+    }
+
+    /// Newest OAuth sample older than this → no fresh signal → spinner idles green. Generous
+    /// enough to cover a couple of missed fetches at the default 5-min refresh.
+    static let oauthStalenessSeconds: TimeInterval = 20 * 60
+    /// Sample pairs closer than this divide a real delta by a tiny denominator (force-refresh
+    /// racing a tick) and yield six-figure $/hr ghosts. Skip them — same guard as `checkDailyPeak`.
+    static let oauthMinIntervalSeconds: TimeInterval = 60
+
+    /// Spinner inputs derived purely from the OAuth `extra_used_usd` series:
+    /// - `current`: $/hr of the most recent valid interval. 0 when that interval has no positive
+    ///   step (idle — a non-billed Teams session never moves the meter) or the newest sample is
+    ///   stale. This is what makes the spinner green when no upstream spend is happening.
+    /// - `median`: median $/hr across the month's active (positive-step) intervals — the "normal
+    ///   pace" the spinner tiers against.
+    static func oauthBurnRates(
+        samples: [BillingSample],
+        now: Date,
+        calendar: Calendar
+    ) -> (current: Double, median: Double) {
+        let sorted = samples.sorted { $0.timestamp < $1.timestamp }
+
+        var current = 0.0
+        if let latest = sorted.last, now.timeIntervalSince(latest.timestamp) <= oauthStalenessSeconds {
+            for i in stride(from: sorted.count - 1, through: 1, by: -1) {
+                let elapsed = sorted[i].timestamp.timeIntervalSince(sorted[i - 1].timestamp)
+                guard elapsed >= oauthMinIntervalSeconds else { continue }
+                let step = sorted[i].totalUSD - sorted[i - 1].totalUSD
+                current = step > 0 ? step / elapsed * 3600 : 0
+                break
+            }
+        }
+
+        let monthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: now))
+            ?? calendar.startOfDay(for: now)
+        let monthly = sorted.filter { $0.timestamp >= monthStart && $0.timestamp <= now }
+        var rates: [Double] = []
+        if monthly.count >= 2 {
+            for i in 1 ..< monthly.count {
+                let elapsed = monthly[i].timestamp.timeIntervalSince(monthly[i - 1].timestamp)
+                guard elapsed >= oauthMinIntervalSeconds else { continue }
+                let step = monthly[i].totalUSD - monthly[i - 1].totalUSD
+                guard step > 0 else { continue }
+                rates.append(step / elapsed * 3600)
+            }
+        }
+        return (current, median(of: rates))
     }
 
     /// Inspect today's OAuth billing samples for a new local peak in per-interval $/hr. Fires
@@ -1053,6 +1119,7 @@ final class BurnTracker: @unchecked Sendable {
         let billingSamples = sampleStore.load()
         let oauthToday = Self.oauthTodayUSD(samples: billingSamples, now: now, calendar: .current)
         let oauthWeek = Self.oauthWeekUSD(samples: billingSamples, now: now, calendar: .current)
+        let oauthBurn = Self.oauthBurnRates(samples: billingSamples, now: now, calendar: .current)
         let snapshot = TrackerSnapshot(
             mode: mode,
             bucketsByMode: bucketsByMode,
@@ -1073,7 +1140,9 @@ final class BurnTracker: @unchecked Sendable {
             billedMonthUSD: billedSoFar,
             billingStatusMessage: billingStatusSoFar,
             oauthTodayUSD: oauthToday,
-            oauthWeekUSD: oauthWeek
+            oauthWeekUSD: oauthWeek,
+            oauthBurnUSDPerHour: oauthBurn.current,
+            oauthMedianBurnUSDPerHour: oauthBurn.median
         )
 
         state.withLock {
