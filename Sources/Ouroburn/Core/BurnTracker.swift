@@ -80,6 +80,17 @@ struct TrackerSnapshot: Sendable {
         oauthWeekUSD ?? weekCostUSD
     }
 
+    /// Reconciliation figure for the "Other" tile: the gap between what Anthropic actually billed
+    /// this month (OAuth `extra_used_usd` MTD) and ouroburn's local JSONL list-price estimate for
+    /// the month. Positive ⇒ billed more than local transcripts account for (spend originating
+    /// outside Claude Code, or pricing the local estimate underrates); negative ⇒ the local
+    /// list-price estimate exceeds billed spend (subscription quota absorbed it). Nil until an
+    /// OAuth month figure exists, so callers can show a placeholder instead of a misleading $0.
+    var otherMonthUSD: Double? {
+        guard let billed = billedMonthUSD else { return nil }
+        return billed - monthCostUSD
+    }
+
     var buckets: [AggregateBucket] {
         bucketsByMode[mode] ?? []
     }
@@ -457,6 +468,27 @@ final class BurnTracker: @unchecked Sendable {
         }
         queue.async { [weak self] in self?.poll(trigger: .force) }
         queue.async { [weak self] in self?.fetchBilling() }
+    }
+
+    /// Wipe only the locally-derived session data — the snapshot cache, the parsed-entries cache,
+    /// and all in-memory aggregation state — then re-parse the transcripts from disk. The OAuth
+    /// billing sample log (`billing-samples.jsonl`) and the upstream billing cache are deliberately
+    /// left untouched so the OAuth-tracked spend history survives the reset. Safe to call from any
+    /// thread.
+    func resetLocalSessionData() {
+        Log.info(Log.tracker, "Resetting local session data — clearing snapshot + entries caches, reparsing from disk")
+        state.withLock { state in
+            state.fileCache = [:]
+            state.lastSnapshot = nil
+            state.lastFileFingerprint = 0
+            state.rateHistory = []
+            state.previousRate = 0
+            state.lastEntriesPersistedAt = nil
+        }
+        // Remove the on-disk local caches. Billing samples (OAuth-tracked) are NOT in these files.
+        try? FileManager.default.removeItem(at: cache.url)
+        try? FileManager.default.removeItem(at: DiskCache.defaultEntriesURL())
+        queue.async { [weak self] in self?.poll(trigger: .force) }
     }
 
     /// Starts the 2s live ticker. Tail-reads only new JSONL bytes; rolling 60s window. Cheap
@@ -1075,12 +1107,17 @@ final class BurnTracker: @unchecked Sendable {
 
         let aggregator = Aggregator(pricing: table)
 
-        // Pre-aggregate every view mode so segmented-control switching is instant.
+        // Pre-aggregate every view mode so segmented-control switching is instant. Session-mode
+        // buckets are scoped to today's entries so the popover opens on "what I worked on today"
+        // rather than the entire session history; the per-mode timeline still spans full history
+        // so the session graph keeps its trailing-7-day trend context.
+        let startOfToday = Calendar.current.startOfDay(for: now)
+        let todayEntries = entries.filter { $0.timestamp >= startOfToday }
         var bucketsByMode: [ViewMode: [AggregateBucket]] = [:]
         var timelinesByMode: [ViewMode: [TimelinePoint]] = [:]
         for viewMode in ViewMode.allCases {
-            let aggregated = aggregator.aggregate(entries: entries, mode: viewMode, now: now)
-            bucketsByMode[viewMode] = aggregated
+            let bucketEntries = viewMode == .session ? todayEntries : entries
+            bucketsByMode[viewMode] = aggregator.aggregate(entries: bucketEntries, mode: viewMode, now: now)
             timelinesByMode[viewMode] = aggregator.timeline(entries: entries, mode: viewMode, now: now)
         }
 

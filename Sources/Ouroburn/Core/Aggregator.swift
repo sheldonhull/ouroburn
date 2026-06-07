@@ -219,6 +219,10 @@ private struct BucketAccumulator {
     var perModel: [String: PerModelAccumulator] = [:]
     var isActive = false
     var isGap = false
+    /// Tracks the `cwd` of the latest-timestamped entry seen, so the finalized bucket carries the
+    /// session's most recent working directory for display.
+    var cwd: String?
+    private var cwdAt: Date = .distantPast
 
     init(id: String, key: String) {
         self.id = id
@@ -233,6 +237,10 @@ private struct BucketAccumulator {
         costUSD += cost
         if let earliest = start { start = min(earliest, entry.timestamp) } else { start = entry.timestamp }
         if let latest = end { end = max(latest, entry.timestamp) } else { end = entry.timestamp }
+        if let entryCwd = entry.cwd, entry.timestamp >= cwdAt {
+            cwd = entryCwd
+            cwdAt = entry.timestamp
+        }
 
         let modelKey = entry.model ?? "unknown"
         var per = perModel[modelKey] ?? PerModelAccumulator(model: modelKey)
@@ -256,7 +264,8 @@ private struct BucketAccumulator {
             costUSD: costUSD,
             models: models,
             isActive: isActive,
-            isGap: isGap
+            isGap: isGap,
+            cwd: cwd
         )
     }
 }

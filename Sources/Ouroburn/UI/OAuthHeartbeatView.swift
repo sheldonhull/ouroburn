@@ -33,6 +33,7 @@ final class OAuthHeartbeatView: NSView {
 
     private let titleLabel = NSTextField(labelWithString: "")
     private let canvas = HeartbeatCanvas()
+    private let pulseHeart = HeartbeatPulse()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -65,6 +66,9 @@ final class OAuthHeartbeatView: NSView {
         beats = Self.buildBeats(samples: allSamples, range: range, now: Date(), calendar: .current)
         canvas.update(beats: beats)
         renderHeader()
+        // Tint the beating heart to match the latest bucket's spend intensity (same ramp the
+        // sparkline uses) so a hot window reads red, a calm one mint.
+        pulseHeart.setTint(canvas.accentColor())
     }
 
     /// One beat per time bucket, each carrying that bucket's reset-aware OAuth spend. Bucketing:
@@ -158,26 +162,97 @@ final class OAuthHeartbeatView: NSView {
         titleLabel.attributedStringValue = Theme.glowAttributedTitle(
             "OAuth billing · \(range.title)",
             color: Theme.accentMint,
-            font: Theme.titleFont(size: 12)
+            font: Theme.titleFont(size: 14)
         )
     }
 
     private func configureSubviews() {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         canvas.translatesAutoresizingMaskIntoConstraints = false
+        pulseHeart.translatesAutoresizingMaskIntoConstraints = false
 
+        addSubview(pulseHeart)
         addSubview(titleLabel)
         addSubview(canvas)
 
         NSLayoutConstraint.activate([
+            pulseHeart.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            pulseHeart.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            pulseHeart.widthAnchor.constraint(equalToConstant: 16),
+            pulseHeart.heightAnchor.constraint(equalToConstant: 16),
+
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            titleLabel.leadingAnchor.constraint(equalTo: pulseHeart.trailingAnchor, constant: 6),
 
             canvas.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
             canvas.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             canvas.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             canvas.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8)
         ])
+    }
+}
+
+/// A small heart glyph that beats with a "lub-dub" rhythm — a slight, continuous animation that
+/// signals the OAuth cost feed is live. Tinted to the current spend intensity by the parent.
+@MainActor
+private final class HeartbeatPulse: NSView {
+    private let heart = NSImageView()
+    private static let animationKey = "ouroburn.heartbeat.pulse"
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        heart.translatesAutoresizingMaskIntoConstraints = false
+        heart.wantsLayer = true
+        heart.image = NSImage(systemSymbolName: "heart.fill", accessibilityDescription: "OAuth cost heartbeat")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold))
+        heart.contentTintColor = Theme.accentMint
+        addSubview(heart)
+        NSLayoutConstraint.activate([
+            heart.centerXAnchor.constraint(equalTo: centerXAnchor),
+            heart.centerYAnchor.constraint(equalTo: centerYAnchor),
+            heart.widthAnchor.constraint(equalTo: widthAnchor),
+            heart.heightAnchor.constraint(equalTo: heightAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("not used")
+    }
+
+    func setTint(_ color: NSColor) {
+        heart.contentTintColor = color
+        heart.layer?.shadowColor = color.cgColor
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Only animate while on screen (the popover is open). CAAnimations added off-window get
+        // dropped, so (re)install on every window attach and remove on detach.
+        if window != nil { startBeating() } else { heart.layer?.removeAnimation(forKey: Self.animationKey) }
+    }
+
+    private func startBeating() {
+        guard let layer = heart.layer, layer.animation(forKey: Self.animationKey) == nil else { return }
+        layer.shadowRadius = 4
+        layer.shadowOffset = .zero
+        // "lub-dub": a quick double tap, then a rest. Keyframe scale + a faint glow pulse.
+        let beat = CAKeyframeAnimation(keyPath: "transform.scale")
+        beat.values = [1.0, 1.22, 1.0, 1.14, 1.0, 1.0]
+        beat.keyTimes = [0.0, 0.10, 0.20, 0.30, 0.42, 1.0]
+        beat.duration = 1.4
+        beat.repeatCount = .infinity
+        beat.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(beat, forKey: Self.animationKey)
+
+        let glow = CAKeyframeAnimation(keyPath: "shadowOpacity")
+        glow.values = [0.0, 0.55, 0.1, 0.4, 0.0, 0.0]
+        glow.keyTimes = [0.0, 0.10, 0.20, 0.30, 0.42, 1.0]
+        glow.duration = 1.4
+        glow.repeatCount = .infinity
+        glow.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(glow, forKey: Self.animationKey + ".glow")
     }
 }
 
@@ -445,15 +520,15 @@ private final class HeartbeatTooltip: NSView {
         layer?.shadowRadius = 8
         layer?.shadowOffset = .zero
 
-        timeLabel.font = Theme.numericFont(size: 11)
+        timeLabel.font = Theme.numericFont(size: 13)
         timeLabel.textColor = Theme.textPrimary
         timeLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        deltaLabel.font = Theme.numericFont(size: 11)
+        deltaLabel.font = Theme.numericFont(size: 14)
         deltaLabel.textColor = Theme.accentPeach
         deltaLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        mtdLabel.font = Theme.bodyFont(size: 10)
+        mtdLabel.font = Theme.bodyFont(size: 12)
         mtdLabel.textColor = Theme.textSecondary
         mtdLabel.translatesAutoresizingMaskIntoConstraints = false
 

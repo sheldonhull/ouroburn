@@ -16,6 +16,13 @@ struct JSONLLoaderTests {
         #expect(entry.dedupKey == "m1:r1")
         #expect(entry.projectPath == "p")
         #expect(entry.sessionId == "s")
+        #expect(entry.cwd == nil)
+    }
+
+    @Test func parsesCwd() throws {
+        let line = #"{"timestamp":"2026-05-06T10:00:00.000Z","requestId":"r1","cwd":"/Users/foo/git/claude-code","message":{"id":"m1","model":"claude-sonnet-4","usage":{"input_tokens":1,"output_tokens":1}}}"#
+        let entry = try #require(JSONLLoader().parseLine(line, project: "p", session: "s"))
+        #expect(entry.cwd == "/Users/foo/git/claude-code")
     }
 
     @Test func rejectsMalformedJson() {

@@ -16,6 +16,12 @@ struct UsageEntry: Equatable, Sendable, Codable {
     let costUSD: Double?
     let projectPath: String
     let sessionId: String
+    /// Working directory recorded on the transcript line (`cwd`). The accurate, un-encoded source
+    /// of a session's directory — Claude Code's project-key encoding (`-Users-foo-bar`) is lossy
+    /// for paths whose segments contain hyphens, so prefer this when present for display names.
+    /// Declared `var` with a default so the synthesized memberwise init treats it as optional and
+    /// pre-`cwd` call sites (tests, older persisted entries) keep compiling/decoding.
+    var cwd: String? = nil
 
     var totalTokens: Int {
         inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens

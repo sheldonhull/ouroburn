@@ -17,6 +17,7 @@ final class MetricsViewController: NSViewController {
     private let todayTile = StatTile(title: "Today", symbol: "sun.max")
     private let weekTile = StatTile(title: "This week", symbol: "calendar")
     private let monthTile = StatTile(title: "This month", symbol: "creditcard")
+    private let otherTile = StatTile(title: "Other", symbol: "plusminus.circle")
 
     private let segmented = NSSegmentedControl()
     private let heartbeatView = OAuthHeartbeatView()
@@ -42,7 +43,6 @@ final class MetricsViewController: NSViewController {
     private var lastRenderedRowIDs: [String] = []
     private var expandedRowIDs = Set<String>()
     private var expandedProjectIDs = Set<String>()
-    private var didAutoExpandTodayForMode: [ViewMode: Bool] = [:]
     private var displayedMode: ViewMode = .day
     private let pulseOrb = PulseOrb()
 
@@ -53,7 +53,9 @@ final class MetricsViewController: NSViewController {
 
     /// Popover content size is pinned so that switching into Session view (whose long encoded
     /// project paths previously stretched the row labels) no longer reflows the popover frame.
-    private static let contentSize = NSSize(width: 580, height: 840)
+    /// Narrower than the original 580pt to read as a tighter overlay; taller so the bottom
+    /// drill-down list gets more vertical room before it has to scroll.
+    private static let contentSize = NSSize(width: 500, height: 912)
 
     override func loadView() {
         let root = NSView(frame: NSRect(origin: .zero, size: Self.contentSize))
@@ -335,6 +337,22 @@ final class MetricsViewController: NSViewController {
             )
         }
 
+        // "Other" reconciliation tile — the signed gap between OAuth-billed month spend and the
+        // local JSONL estimate. Surfaces charges the local transcripts can't explain. Shows a
+        // placeholder until an OAuth month figure exists.
+        if let other = snapshot.otherMonthUSD {
+            let accent: NSColor = abs(other) < 0.005
+                ? Theme.accentMint
+                : (other > 0 ? Theme.accentPeach : Theme.accentBlue)
+            otherTile.updateDelta(
+                valueUSD: other,
+                caption: "OAuth − local",
+                accent: accent
+            )
+        } else {
+            otherTile.updateDelta(valueUSD: nil, caption: "needs OAuth", accent: Theme.accentBlue)
+        }
+
         // Connection state derivation order:
         // 1. Mid-PKCE-flow always wins — never overwrite the spinner.
         // 2. If the last billing fetch produced a structured health, that's authoritative.
@@ -418,7 +436,6 @@ final class MetricsViewController: NSViewController {
         // Spinner suppressed: pulse orb handles the "still working" signal, and the empty-state
         // card surfaces the "no data yet" message when buckets are genuinely empty.
         listSpinner.setLoading(false)
-        autoExpandTodayIfNeeded(mode: displayedMode, buckets: buckets)
         if same, !force {
             updateRowsInPlace(buckets: buckets)
             return
@@ -426,24 +443,6 @@ final class MetricsViewController: NSViewController {
         lastRenderedMode = displayedMode
         lastRenderedRowIDs = ids
         renderRows(buckets)
-    }
-
-    /// First time we render a non-empty list for a given mode, expand the bucket that represents
-    /// "today" (or the most-recent bucket as a proxy when no `start` date is on the bucket). This
-    /// lines up with how the user actually reads the popover — they almost always want to drill
-    /// into the current day on open without an extra click.
-    private func autoExpandTodayIfNeeded(mode: ViewMode, buckets: [AggregateBucket]) {
-        guard didAutoExpandTodayForMode[mode] != true, !buckets.isEmpty else { return }
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        let target = buckets.first(where: { bucket in
-            guard let start = bucket.start else { return false }
-            return calendar.isDate(start, inSameDayAs: today)
-        }) ?? buckets.first
-        if let target {
-            expandedRowIDs.insert(target.id)
-        }
-        didAutoExpandTodayForMode[mode] = true
     }
 
     private func configureHero() {
@@ -454,8 +453,12 @@ final class MetricsViewController: NSViewController {
         todayTile.translatesAutoresizingMaskIntoConstraints = false
         weekTile.translatesAutoresizingMaskIntoConstraints = false
         monthTile.translatesAutoresizingMaskIntoConstraints = false
+        otherTile.translatesAutoresizingMaskIntoConstraints = false
         monthTile.onClick = { [weak self] in self?.onMonthlyTileClick?() }
         monthTile.toolTip = "Click for sample-by-sample Anthropic spend history"
+        otherTile.toolTip = "OAuth-billed month minus local JSONL estimate. Positive = billed spend "
+            + "the local transcripts don't account for (e.g. usage outside Claude Code); negative = "
+            + "local list-price estimate the subscription quota absorbed."
 
         // Hover a tile to scope the OAuth graph to that range. Only the enter switches — there's
         // no revert on exit, so moving the cursor off a tile and down onto the graph keeps the
@@ -464,6 +467,7 @@ final class MetricsViewController: NSViewController {
         todayTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.today) } }
         weekTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.week) } }
         monthTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.month) } }
+        otherTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.month) } }
 
         let rateStack = NSStackView(views: [headlineRate, headlineSubrate])
         rateStack.orientation = .vertical
@@ -481,11 +485,11 @@ final class MetricsViewController: NSViewController {
         topRow.spacing = 12
         topRow.translatesAutoresizingMaskIntoConstraints = false
 
-        let tileRow = NSStackView(views: [todayTile, weekTile, monthTile])
+        let tileRow = NSStackView(views: [todayTile, weekTile, monthTile, otherTile])
         tileRow.orientation = .horizontal
         tileRow.alignment = .top
         tileRow.distribution = .fillEqually
-        tileRow.spacing = 10
+        tileRow.spacing = 8
         tileRow.translatesAutoresizingMaskIntoConstraints = false
 
         view.addSubview(topRow)
@@ -740,12 +744,18 @@ final class MetricsViewController: NSViewController {
     /// tokens/cost) and stays collapsed by default; sessions only render when the user expands
     /// the project. Mirrors the day/week/month rows so users get one extra grouping layer.
     private func renderSessionTree(_ buckets: [AggregateBucket]) {
-        struct Item { let bucket: AggregateBucket; let segments: [String]; let session: String }
+        struct Item {
+            let bucket: AggregateBucket
+            let project: String
+            let segments: [String]
+            let session: String
+        }
 
         let items: [Item] = buckets.compactMap { bucket in
             guard let split = ProjectPath.splitSessionBucketID(bucket.id) else { return nil }
             return Item(
                 bucket: bucket,
+                project: split.project,
                 segments: ProjectPath.segments(split.project),
                 session: split.session
             )
@@ -788,9 +798,15 @@ final class MetricsViewController: NSViewController {
             let group = groupItems[key] ?? []
             let totals = projectTotals(group.map(\.bucket))
             let isExpanded = expandedProjectIDs.contains(key)
+            // Prefer the accurate working directory recorded on the transcript over the lossy
+            // `-`-decoded path tail. `group.first` is the most-recently active session in the group.
+            let rep = group.first
+            let title = rep
+                .flatMap { ProjectPath.directoryLeaf(cwd: $0.bucket.cwd, project: $0.project) }
+                ?? tail.joined(separator: "/")
             appendProjectGroupRow(
                 key: key,
-                tail: tail,
+                title: title,
                 sessionCount: group.count,
                 totalTokens: totals.tokens,
                 totalCost: totals.cost,
@@ -800,7 +816,11 @@ final class MetricsViewController: NSViewController {
             guard isExpanded else { continue }
             for item in group {
                 if rendered >= rowRenderCap { break }
-                appendBucketRow(bucket: item.bucket, displayKey: shortSession(item.session), indent: 18)
+                appendBucketRow(
+                    bucket: item.bucket,
+                    displayKey: sessionDisplayName(for: item.bucket, project: item.project, session: item.session),
+                    indent: 18
+                )
                 rendered += 1
             }
             if rendered >= rowRenderCap { break }
@@ -870,7 +890,7 @@ final class MetricsViewController: NSViewController {
 
     private func appendProjectGroupRow(
         key: String,
-        tail: [String],
+        title: String,
         sessionCount: Int,
         totalTokens: Int,
         totalCost: Double,
@@ -879,7 +899,7 @@ final class MetricsViewController: NSViewController {
     ) {
         let row = ProjectGroupRowView(
             key: key,
-            title: tail.joined(separator: "/"),
+            title: title,
             sessionCount: sessionCount,
             totalTokens: totalTokens,
             totalCost: totalCost,
@@ -908,6 +928,23 @@ final class MetricsViewController: NSViewController {
         let tail = id.suffix(4)
         return "\(head)…\(tail)"
     }
+
+    /// Human-readable label for a session row: the working directory the session ran in, suffixed
+    /// with its start time so same-directory sessions stay distinguishable. Falls back to the
+    /// shortened session UUID when no directory can be resolved.
+    private func sessionDisplayName(for bucket: AggregateBucket, project: String, session: String) -> String {
+        guard let dir = ProjectPath.directoryLeaf(cwd: bucket.cwd, project: project) else {
+            return shortSession(session)
+        }
+        guard let start = bucket.start else { return dir }
+        return "\(dir) · \(Self.timeFormatter.string(from: start))"
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
 
     private func updateRowsInPlace(buckets: [AggregateBucket]) {
         // Same id list, same mode — only the underlying tokens/cost numbers may have moved.
@@ -1085,6 +1122,38 @@ final class StatTile: NSView {
 
     override func mouseExited(with _: NSEvent) {
         onHover?(false)
+    }
+
+    /// Variant for the "Other" reconciliation tile: a signed dollar delta with a free-text caption
+    /// in place of the token line. `valueUSD == nil` renders a dim placeholder dash.
+    func updateDelta(valueUSD: Double?, caption: String, accent: NSColor) {
+        if let valueUSD {
+            let sign = valueUSD >= 0 ? "+" : "−"
+            cost.attributedStringValue = Theme.glowAttributedTitle(
+                "\(sign)\(NumberFormatting.compactDollars(abs(valueUSD)))",
+                color: accent,
+                font: Theme.titleFont(size: 18)
+            )
+        } else {
+            cost.attributedStringValue = Theme.glowAttributedTitle(
+                "—",
+                color: Theme.textTertiary,
+                font: Theme.titleFont(size: 18)
+            )
+        }
+        tokens.stringValue = caption
+        tokens.font = Theme.bodyFont(size: 11)
+        tokens.textColor = Theme.textSecondary
+        symbolView.contentTintColor = accent
+        if let layer {
+            Theme.applyGhostRim(
+                layer,
+                color: accent,
+                rimAlpha: valueUSD == nil ? 0.12 : 0.32,
+                glowRadius: 12,
+                glowAlpha: valueUSD == nil ? 0.08 : 0.30
+            )
+        }
     }
 
     func update(tokens tokenCount: Int, costUSD: Double, accent: NSColor, placeholder: Bool = false) {
@@ -1596,11 +1665,19 @@ private final class TopSessionsView: NSView {
 
         for (index, item) in visible.enumerated() {
             let tail = Array(item.segments.dropFirst(prefix.count))
-            let projectName = tail.last ?? tail.joined(separator: "/")
+            // Prefer the accurate transcript `cwd` leaf over the lossy decoded path tail.
+            let cwdLeaf = item.bucket.cwd.flatMap { cwd -> String? in
+                let leaf = (cwd as NSString).lastPathComponent
+                return (leaf.isEmpty || leaf == "/") ? nil : leaf
+            }
+            let projectName = cwdLeaf ?? tail.last ?? tail.joined(separator: "/")
+            // Replace the opaque session UUID with its start time — readable and, within today's
+            // scope, enough to tell same-directory sessions apart.
+            let secondary = item.bucket.start.map(Self.timeFormatter.string(from:)) ?? shortSession(item.session)
             let row = TopSessionsRow(
                 rank: index + 1,
                 project: projectName,
-                session: shortSession(item.session),
+                session: secondary,
                 tokens: item.bucket.totalTokens,
                 cost: item.bucket.costUSD,
                 liveTokensPerMinute: item.velocity?.tokensPerMinute,
@@ -1618,6 +1695,12 @@ private final class TopSessionsView: NSView {
         let tail = id.suffix(4)
         return "\(head)…\(tail)"
     }
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
 }
 
 @MainActor

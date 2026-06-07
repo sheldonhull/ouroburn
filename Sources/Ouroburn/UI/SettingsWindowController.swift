@@ -5,6 +5,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let logFolderURL: URL
     private let cacheURL: URL
     private let onResetCache: () -> Void
+    private let onResetLocalData: () -> Void
     private let onPreferencesSaved: (Preferences) -> Void
 
     private let oauthField = NSSecureTextField()
@@ -30,11 +31,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         logFolderURL: URL,
         cacheURL: URL,
         onResetCache: @escaping () -> Void,
+        onResetLocalData: @escaping () -> Void,
         onPreferencesSaved: @escaping (Preferences) -> Void
     ) {
         self.logFolderURL = logFolderURL
         self.cacheURL = cacheURL
         self.onResetCache = onResetCache
+        self.onResetLocalData = onResetLocalData
         self.onPreferencesSaved = onPreferencesSaved
 
         let window = NSWindow(
@@ -431,12 +434,20 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
         let revealLogs = makeButton(title: "Reveal logs", action: #selector(revealLogFolder(_:)))
         let resetCache = makeButton(title: "Reset cache", action: #selector(resetCache(_:)))
-        let actions = NSStackView(views: [revealLogs, resetCache])
+        let resetLocal = makeButton(title: "Reset local session data", action: #selector(resetLocalData(_:)))
+        let actions = NSStackView(views: [revealLogs, resetCache, resetLocal])
         actions.orientation = .horizontal
         actions.spacing = 8
         actions.translatesAutoresizingMaskIntoConstraints = false
 
-        let body = NSStackView(views: [label, actions])
+        let hint = NSTextField(wrappingLabelWithString:
+            "“Reset local session data” clears the snapshot + parsed-transcript caches and "
+                + "re-reads the JSONL from disk. OAuth-tracked billing history is left untouched.")
+        hint.font = Theme.bodyFont(size: 10)
+        hint.textColor = Theme.textTertiary
+        hint.translatesAutoresizingMaskIntoConstraints = false
+
+        let body = NSStackView(views: [label, actions, hint])
         body.orientation = .vertical
         body.alignment = .leading
         body.spacing = 8
@@ -645,6 +656,15 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         try? FileManager.default.removeItem(at: cacheURL)
         onResetCache()
         statusLabel.stringValue = "Snapshot cache cleared"
+    }
+
+    @objc private func resetLocalData(_: Any?) {
+        Log.info(Log.app, "Reset local session data requested from settings")
+        onResetLocalData()
+        statusLabel.stringValue = "Local session data reset — reloading transcripts from disk"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            self?.statusLabel.stringValue = " "
+        }
     }
 }
 

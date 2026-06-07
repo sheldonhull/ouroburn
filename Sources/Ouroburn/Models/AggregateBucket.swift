@@ -15,6 +15,10 @@ struct AggregateBucket: Equatable, Sendable, Identifiable {
     let models: [ModelBreakdown]
     let isActive: Bool
     let isGap: Bool
+    /// Representative working directory for the bucket (latest entry's `cwd`). Drives the
+    /// human-readable session/project labels. Defaulted so non-session buckets and pre-`cwd` call
+    /// sites omit it. See `UsageEntry.cwd`.
+    var cwd: String? = nil
 
     var totalTokens: Int {
         inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens
