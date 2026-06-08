@@ -130,6 +130,9 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
             // Refresh the live priority panel from the cached snapshot before the popover slides
             // in so the OAuth heartbeat + top-5 sessions read fresh on every open.
             metrics.popoverWillShow()
+            // Pull a fresh poll ahead of the next scheduled tick and slide the timer so we don't
+            // also fire a routine poll seconds later. The refresh rising-edge pulses the indicator.
+            tracker.refreshAndRescheduleTimer()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
             // Tail-read JSONLs every 2s while the popover is visible. Stops on close so we don't

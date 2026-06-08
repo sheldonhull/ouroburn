@@ -68,7 +68,7 @@ final class ToastWindow {
     }
 
     private init(title: String, message: String, accent: NSColor) {
-        let width: CGFloat = 560
+        let width: CGFloat = 640
         let height: CGFloat = 88
         panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -125,7 +125,12 @@ final class ToastWindow {
 private final class ToastContentView: NSView {
     var onDismiss: (() -> Void)?
 
+    private let icon = NSImageView()
+    private let accent: NSColor
+    private static let pulseKey = "ouroburn.toast.ekg"
+
     init(title: String, message: String, accent: NSColor) {
+        self.accent = accent
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 12
@@ -134,8 +139,8 @@ private final class ToastContentView: NSView {
         layer?.borderWidth = 1
         Theme.applyGhostRim(layer!, color: accent, rimAlpha: 0.55, glowRadius: 14, glowAlpha: 0.42)
 
-        let icon = NSImageView()
-        icon.image = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: nil)
+        icon.wantsLayer = true
+        icon.image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: nil)
         icon.contentTintColor = accent
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 20, weight: .semibold)
         icon.translatesAutoresizingMaskIntoConstraints = false
@@ -205,5 +210,37 @@ private final class ToastContentView: NSView {
 
     @objc private func handleClose() {
         onDismiss?()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // EKG-style pulse on the alert icon, only while on screen. CAAnimations added off-window
+        // get dropped, so (re)install on attach and remove on detach.
+        if window != nil { startEKGPulse() } else { icon.layer?.removeAnimation(forKey: Self.pulseKey) }
+    }
+
+    /// "lub-dub" double-beat scale + glow — the heartbeat pulse, reserved for this top-corner alert
+    /// rather than running on the always-visible panel.
+    private func startEKGPulse() {
+        guard let layer = icon.layer, layer.animation(forKey: Self.pulseKey) == nil else { return }
+        layer.shadowColor = accent.cgColor
+        layer.shadowRadius = 5
+        layer.shadowOffset = .zero
+
+        let beat = CAKeyframeAnimation(keyPath: "transform.scale")
+        beat.values = [1.0, 1.24, 1.0, 1.16, 1.0, 1.0]
+        beat.keyTimes = [0.0, 0.10, 0.20, 0.30, 0.42, 1.0]
+        beat.duration = 1.4
+        beat.repeatCount = .infinity
+        beat.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(beat, forKey: Self.pulseKey)
+
+        let glow = CAKeyframeAnimation(keyPath: "shadowOpacity")
+        glow.values = [0.0, 0.6, 0.1, 0.45, 0.0, 0.0]
+        glow.keyTimes = [0.0, 0.10, 0.20, 0.30, 0.42, 1.0]
+        glow.duration = 1.4
+        glow.repeatCount = .infinity
+        glow.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(glow, forKey: Self.pulseKey + ".glow")
     }
 }

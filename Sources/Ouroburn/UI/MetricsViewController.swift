@@ -10,14 +10,11 @@ final class MetricsViewController: NSViewController {
     var onMonthlyTileClick: (() -> Void)?
     var onRefreshPricingClick: (() -> Void)?
 
-    private let headlineRate = NSTextField(labelWithString: "—")
-    private let headlineSubrate = NSTextField(labelWithString: "")
-    private let headlineCost = NSTextField(labelWithString: "—")
-    private let medianBar = ProgressBar()
     private let todayTile = StatTile(title: "Today", symbol: "sun.max")
-    private let weekTile = StatTile(title: "This week", symbol: "calendar")
-    private let monthTile = StatTile(title: "This month", symbol: "creditcard")
+    private let weekTile = StatTile(title: "Week", symbol: "calendar")
     private let otherTile = StatTile(title: "Other", symbol: "plusminus.circle")
+    private let monthTile = StatTile(title: "Month", symbol: "creditcard")
+    private let projTile = StatTile(title: "Proj", symbol: "chart.line.uptrend.xyaxis")
 
     private let segmented = NSSegmentedControl()
     private let heartbeatView = OAuthHeartbeatView()
@@ -44,7 +41,6 @@ final class MetricsViewController: NSViewController {
     private var expandedRowIDs = Set<String>()
     private var expandedProjectIDs = Set<String>()
     private var displayedMode: ViewMode = .day
-    private let pulseOrb = PulseOrb()
 
     /// Hard cap on rows rendered into the popover. Session view alone can produce 1k+ rows;
     /// rebuilding that many NSViews on every snapshot pegs the main thread. Rows beyond this
@@ -55,7 +51,7 @@ final class MetricsViewController: NSViewController {
     /// project paths previously stretched the row labels) no longer reflows the popover frame.
     /// Narrower than the original 580pt to read as a tighter overlay; taller so the bottom
     /// drill-down list gets more vertical room before it has to scroll.
-    private static let contentSize = NSSize(width: 500, height: 912)
+    private static let contentSize = NSSize(width: 580, height: 912)
 
     override func loadView() {
         let root = NSView(frame: NSRect(origin: .zero, size: Self.contentSize))
@@ -84,10 +80,9 @@ final class MetricsViewController: NSViewController {
 
     func setRefreshState(_ state: RefreshState) {
         refreshBanner.setState(state)
-        // Visual heartbeat: every poll cycle the tracker flips isRefreshing true → false.
-        // Pulse on the rising edge so the user gets a single satisfying blip per cycle, not a
-        // continuous animation.
-        if state.isRefreshing { pulseOrb.pulse() }
+        // Every poll cycle the tracker flips isRefreshing true → false. Pulse the connection
+        // indicator on the rising edge so the colored status icon gives one blip per refresh.
+        if state.isRefreshing { pulseConnectionIcon() }
     }
 
     enum ConnectionState: Equatable {
@@ -180,6 +175,20 @@ final class MetricsViewController: NSViewController {
         }
     }
 
+    /// One-shot scale+glow blip on the connection indicator, fired on each refresh rising edge.
+    /// Uses transform.scale so it never collides with the continuous opacity blink the
+    /// authInvalid state may have running on the same layer.
+    private func pulseConnectionIcon() {
+        guard let layer = connectionButton.layer else { return }
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 1.0
+        scale.toValue = 1.3
+        scale.duration = 0.16
+        scale.autoreverses = true
+        scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(scale, forKey: "ouroburn.connection.pulse")
+    }
+
     @objc private func connectionButtonClicked(_: Any?) {
         onLoginClick?()
     }
@@ -231,15 +240,8 @@ final class MetricsViewController: NSViewController {
     /// and re-ranks the top-5 sessions by current tokens/min. Replaces nothing in the buckets/
     /// timeline data — those still come from the 60s snapshot.
     func applyLive(snapshot live: LiveSnapshot) {
-        // Hero USD/hr — only override when there's actual live activity, otherwise keep the 5-min
-        // projected number from the latest snapshot.
-        if live.tokensPerMinute > 0 {
-            headlineCost.attributedStringValue = Theme.glowAttributedTitle(
-                "\(NumberFormatting.compactRate(dollarsPerHour: live.costPerHour)) · live",
-                color: Theme.accentMint,
-                font: Theme.titleFont(size: 18)
-            )
-        }
+        // Hero rate/cost headline was removed — the OAuth heartbeat + tiles carry the live view.
+        // Live ticks now only re-rank the top-5 sessions by current tokens/min.
         topSessionsView.applyLive(velocities: live.perSession)
     }
 
@@ -276,33 +278,6 @@ final class MetricsViewController: NSViewController {
     }
 
     private func renderHero(snapshot: TrackerSnapshot) {
-        let stale = snapshot.stale ? "  ·  loading…" : ""
-        let median = snapshot.medianTokensPerMinute
-        let live = snapshot.tokensPerMinute
-
-        headlineRate.attributedStringValue = Theme.glowAttributedTitle(
-            "\(NumberFormatting.compactTokens(Int(median))) tk/m",
-            color: rateColor(rate: median),
-            font: Theme.titleFont(size: 28)
-        )
-        headlineSubrate.stringValue = String(
-            format: "median (rolling 30m) · live %@ tk/m%@",
-            NumberFormatting.compactTokens(Int(live)), stale
-        )
-        headlineSubrate.font = Theme.bodyFont(size: 11)
-        headlineSubrate.textColor = Theme.textTertiary
-
-        headlineCost.attributedStringValue = Theme.glowAttributedTitle(
-            NumberFormatting.compactRate(dollarsPerHour: snapshot.costPerHour),
-            color: Theme.accentMint,
-            font: Theme.titleFont(size: 18)
-        )
-
-        medianBar.setProgress(
-            value: min(median, 5000) / 5000,
-            tint: rateColor(rate: median)
-        )
-
         // Cost prefers OAuth midnight-delta (billed truth); tokens stay JSONL since OAuth exposes
         // no token count.
         todayTile.update(
@@ -346,11 +321,28 @@ final class MetricsViewController: NSViewController {
                 : (other > 0 ? Theme.accentPeach : Theme.accentBlue)
             otherTile.updateDelta(
                 valueUSD: other,
-                caption: "OAuth − local",
+                caption: "unexplained",
                 accent: accent
             )
         } else {
             otherTile.updateDelta(valueUSD: nil, caption: "needs OAuth", accent: Theme.accentBlue)
+        }
+
+        // Projected month-end spend from the median active-day OAuth burn. Caption shows the
+        // per-day burn driving it; grows more accurate as the month accumulates days.
+        if let proj = BurnTracker.monthlyProjection(
+            samples: heartbeatStore.load(),
+            monthToDateUSD: snapshot.billedMonthUSD,
+            now: Date(),
+            calendar: .current
+        ) {
+            projTile.updateCaptioned(
+                costUSD: proj.projectedUSD,
+                caption: "\(NumberFormatting.compactDollars(proj.dailyBurnUSD))/day",
+                accent: Theme.accentLime
+            )
+        } else {
+            projTile.updateCaptioned(costUSD: nil, caption: "needs OAuth", accent: Theme.accentBlue)
         }
 
         // Connection state derivation order:
@@ -446,19 +438,16 @@ final class MetricsViewController: NSViewController {
     }
 
     private func configureHero() {
-        headlineRate.translatesAutoresizingMaskIntoConstraints = false
-        headlineSubrate.translatesAutoresizingMaskIntoConstraints = false
-        headlineCost.translatesAutoresizingMaskIntoConstraints = false
-        medianBar.translatesAutoresizingMaskIntoConstraints = false
-        todayTile.translatesAutoresizingMaskIntoConstraints = false
-        weekTile.translatesAutoresizingMaskIntoConstraints = false
-        monthTile.translatesAutoresizingMaskIntoConstraints = false
-        otherTile.translatesAutoresizingMaskIntoConstraints = false
+        for tile in [todayTile, weekTile, otherTile, monthTile, projTile] {
+            tile.translatesAutoresizingMaskIntoConstraints = false
+        }
         monthTile.onClick = { [weak self] in self?.onMonthlyTileClick?() }
         monthTile.toolTip = "Click for sample-by-sample Anthropic spend history"
         otherTile.toolTip = "OAuth-billed month minus local JSONL estimate. Positive = billed spend "
             + "the local transcripts don't account for (e.g. usage outside Claude Code); negative = "
             + "local list-price estimate the subscription quota absorbed."
+        projTile.toolTip = "Projected month-end spend: month-to-date + median active-day OAuth burn "
+            + "× remaining weekdays (+1 for today). Weekends count only if they billed."
 
         // Hover a tile to scope the OAuth graph to that range. Only the enter switches — there's
         // no revert on exit, so moving the cursor off a tile and down onto the graph keeps the
@@ -466,49 +455,24 @@ final class MetricsViewController: NSViewController {
         // popover open (see `popoverWillShow`).
         todayTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.today) } }
         weekTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.week) } }
-        monthTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.month) } }
         otherTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.month) } }
+        monthTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.month) } }
+        projTile.onHover = { [weak self] inside in if inside { self?.heartbeatView.setRange(.month) } }
 
-        let rateStack = NSStackView(views: [headlineRate, headlineSubrate])
-        rateStack.orientation = .vertical
-        rateStack.alignment = .leading
-        rateStack.spacing = 0
-        rateStack.translatesAutoresizingMaskIntoConstraints = false
-
-        pulseOrb.translatesAutoresizingMaskIntoConstraints = false
-        pulseOrb.toolTip = "Pulses on every refresh tick"
-
-        let topRow = NSStackView(views: [rateStack, pulseOrb, NSView(), headlineCost])
-        topRow.orientation = .horizontal
-        topRow.alignment = .firstBaseline
-        topRow.distribution = .fill
-        topRow.spacing = 12
-        topRow.translatesAutoresizingMaskIntoConstraints = false
-
-        let tileRow = NSStackView(views: [todayTile, weekTile, monthTile, otherTile])
+        // Other sits left of Month; Projected closes the row to the right of Month.
+        let tileRow = NSStackView(views: [todayTile, weekTile, otherTile, monthTile, projTile])
         tileRow.orientation = .horizontal
         tileRow.alignment = .top
         tileRow.distribution = .fillEqually
-        tileRow.spacing = 8
+        tileRow.spacing = 6
         tileRow.translatesAutoresizingMaskIntoConstraints = false
 
-        view.addSubview(topRow)
-        view.addSubview(medianBar)
         view.addSubview(tileRow)
 
         NSLayoutConstraint.activate([
-            topRow.topAnchor.constraint(equalTo: view.topAnchor, constant: 18),
-            topRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
-            topRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
-
-            medianBar.topAnchor.constraint(equalTo: topRow.bottomAnchor, constant: 10),
-            medianBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
-            medianBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
-            medianBar.heightAnchor.constraint(equalToConstant: 6),
-
-            tileRow.topAnchor.constraint(equalTo: medianBar.bottomAnchor, constant: 14),
-            tileRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
-            tileRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
+            tileRow.topAnchor.constraint(equalTo: view.topAnchor, constant: 16),
+            tileRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            tileRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
             tileRow.heightAnchor.constraint(equalToConstant: 86)
         ])
     }
@@ -1156,6 +1120,37 @@ final class StatTile: NSView {
         }
     }
 
+    /// Variant for the "Projected" tile: an unsigned dollar value with a free-text caption in
+    /// place of the token line. `costUSD == nil` renders a dim placeholder dash.
+    func updateCaptioned(costUSD: Double?, caption: String, accent: NSColor) {
+        if let costUSD {
+            cost.attributedStringValue = Theme.glowAttributedTitle(
+                NumberFormatting.compactDollars(costUSD),
+                color: accent,
+                font: Theme.titleFont(size: 18)
+            )
+        } else {
+            cost.attributedStringValue = Theme.glowAttributedTitle(
+                "—",
+                color: Theme.textTertiary,
+                font: Theme.titleFont(size: 18)
+            )
+        }
+        tokens.stringValue = caption
+        tokens.font = Theme.bodyFont(size: 11)
+        tokens.textColor = Theme.textSecondary
+        symbolView.contentTintColor = accent
+        if let layer {
+            Theme.applyGhostRim(
+                layer,
+                color: accent,
+                rimAlpha: costUSD == nil ? 0.12 : 0.32,
+                glowRadius: 12,
+                glowAlpha: costUSD == nil ? 0.08 : 0.30
+            )
+        }
+    }
+
     func update(tokens tokenCount: Int, costUSD: Double, accent: NSColor, placeholder: Bool = false) {
         if placeholder {
             cost.attributedStringValue = Theme.glowAttributedTitle(
@@ -1193,6 +1188,8 @@ final class StatTile: NSView {
     private func configureSubviews() {
         title.font = Theme.bodyFont(size: 10)
         title.textColor = Theme.textTertiary
+        title.lineBreakMode = .byTruncatingTail
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         title.translatesAutoresizingMaskIntoConstraints = false
 
         cost.translatesAutoresizingMaskIntoConstraints = false
@@ -1212,6 +1209,8 @@ final class StatTile: NSView {
         NSLayoutConstraint.activate([
             title.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            // Keep the title clear of the symbol so long labels truncate instead of sliding under it.
+            title.trailingAnchor.constraint(lessThanOrEqualTo: symbolView.leadingAnchor, constant: -4),
 
             symbolView.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             symbolView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
@@ -1225,55 +1224,6 @@ final class StatTile: NSView {
             tokens.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             tokens.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -10)
         ])
-    }
-}
-
-@MainActor
-private final class ProgressBar: NSView {
-    private let track = NSView()
-    private let fill = NSView()
-    private var fillWidthConstraint: NSLayoutConstraint?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        track.wantsLayer = true
-        track.layer?.backgroundColor = Theme.surface.cgColor
-        track.layer?.cornerRadius = 3
-        track.translatesAutoresizingMaskIntoConstraints = false
-        fill.wantsLayer = true
-        fill.layer?.cornerRadius = 3
-        fill.layer?.backgroundColor = Theme.accentBlue.cgColor
-        fill.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(track)
-        track.addSubview(fill)
-        let widthC = fill.widthAnchor.constraint(equalToConstant: 0)
-        fillWidthConstraint = widthC
-        NSLayoutConstraint.activate([
-            track.topAnchor.constraint(equalTo: topAnchor),
-            track.leadingAnchor.constraint(equalTo: leadingAnchor),
-            track.trailingAnchor.constraint(equalTo: trailingAnchor),
-            track.bottomAnchor.constraint(equalTo: bottomAnchor),
-            fill.topAnchor.constraint(equalTo: track.topAnchor),
-            fill.bottomAnchor.constraint(equalTo: track.bottomAnchor),
-            fill.leadingAnchor.constraint(equalTo: track.leadingAnchor),
-            widthC
-        ])
-    }
-
-    @available(*, unavailable)
-    required init?(coder _: NSCoder) {
-        fatalError("not used")
-    }
-
-    func setProgress(value: Double, tint: NSColor) {
-        let trackWidth = max(track.bounds.width, bounds.width)
-        fillWidthConstraint?.constant = trackWidth * CGFloat(min(max(value, 0), 1))
-        fill.layer?.backgroundColor = tint.cgColor
-        fill.layer?.shadowColor = tint.cgColor
-        fill.layer?.shadowRadius = 4
-        fill.layer?.shadowOpacity = 0.6
-        fill.layer?.shadowOffset = .zero
     }
 }
 
@@ -1965,89 +1915,6 @@ private final class ProjectGroupRowView: NSView {
             row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10)
         ])
-    }
-}
-
-/// Small mint orb that emits one scale+opacity pulse per refresh tick. Sized to slot inline with
-/// the hero rate label without competing for visual weight — it's a confirmation signal, not a
-/// status badge.
-@MainActor
-final class PulseOrb: NSView {
-    private let orb = NSView()
-    private let halo = NSView()
-    private static let baseDiameter: CGFloat = 10
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        translatesAutoresizingMaskIntoConstraints = false
-        widthAnchor.constraint(equalToConstant: 22).isActive = true
-        heightAnchor.constraint(equalToConstant: 22).isActive = true
-
-        halo.wantsLayer = true
-        halo.translatesAutoresizingMaskIntoConstraints = false
-        halo.layer?.backgroundColor = Theme.accentMint.withAlphaComponent(0.0).cgColor
-        halo.layer?.cornerRadius = Self.baseDiameter
-        halo.layer?.shadowColor = Theme.accentMint.cgColor
-        halo.layer?.shadowRadius = 6
-        halo.layer?.shadowOpacity = 0
-        halo.layer?.shadowOffset = .zero
-
-        orb.wantsLayer = true
-        orb.translatesAutoresizingMaskIntoConstraints = false
-        orb.layer?.backgroundColor = Theme.accentMint.cgColor
-        orb.layer?.cornerRadius = Self.baseDiameter / 2
-
-        addSubview(halo)
-        addSubview(orb)
-
-        NSLayoutConstraint.activate([
-            orb.widthAnchor.constraint(equalToConstant: Self.baseDiameter),
-            orb.heightAnchor.constraint(equalToConstant: Self.baseDiameter),
-            orb.centerXAnchor.constraint(equalTo: centerXAnchor),
-            orb.centerYAnchor.constraint(equalTo: centerYAnchor),
-
-            halo.widthAnchor.constraint(equalToConstant: Self.baseDiameter * 2),
-            halo.heightAnchor.constraint(equalToConstant: Self.baseDiameter * 2),
-            halo.centerXAnchor.constraint(equalTo: centerXAnchor),
-            halo.centerYAnchor.constraint(equalTo: centerYAnchor)
-        ])
-    }
-
-    @available(*, unavailable)
-    required init?(coder _: NSCoder) {
-        fatalError("not used")
-    }
-
-    func pulse() {
-        guard let orbLayer = orb.layer, let haloLayer = halo.layer else { return }
-        // Orb: subtle scale-up to amplify presence.
-        let orbScale = CABasicAnimation(keyPath: "transform.scale")
-        orbScale.fromValue = 1.0
-        orbScale.toValue = 1.35
-        orbScale.duration = 0.18
-        orbScale.autoreverses = true
-        orbScale.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        orbLayer.add(orbScale, forKey: "pulseScale")
-
-        // Halo: expanding ring with fading opacity. Re-create the animation each time so back-to-
-        // back pulses don't stack on the same animation key.
-        let haloScale = CABasicAnimation(keyPath: "transform.scale")
-        haloScale.fromValue = 0.6
-        haloScale.toValue = 1.4
-        haloScale.duration = 0.6
-
-        let haloOpacity = CABasicAnimation(keyPath: "opacity")
-        haloOpacity.fromValue = 0.6
-        haloOpacity.toValue = 0.0
-        haloOpacity.duration = 0.6
-
-        let group = CAAnimationGroup()
-        group.animations = [haloScale, haloOpacity]
-        group.duration = 0.6
-        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        haloLayer.shadowOpacity = 0
-        haloLayer.add(group, forKey: "pulseHalo")
     }
 }
 

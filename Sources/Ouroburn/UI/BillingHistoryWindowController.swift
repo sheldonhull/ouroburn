@@ -24,7 +24,6 @@ final class BillingHistoryWindowController: NSWindowController {
     private let timeColumnID = NSUserInterfaceItemIdentifier("time")
     private let totalColumnID = NSUserInterfaceItemIdentifier("total")
     private let deltaColumnID = NSUserInterfaceItemIdentifier("delta")
-    private let rateColumnID = NSUserInterfaceItemIdentifier("rate")
     private let dataSourceProxy = OutlineProxy()
 
     init() {
@@ -99,14 +98,8 @@ final class BillingHistoryWindowController: NSWindowController {
         let deltaColumn = NSTableColumn(identifier: deltaColumnID)
         deltaColumn.title = "Δ"
         deltaColumn.minWidth = 90
-        deltaColumn.width = 120
+        deltaColumn.width = 140
         outline.addTableColumn(deltaColumn)
-
-        let rateColumn = NSTableColumn(identifier: rateColumnID)
-        rateColumn.title = "$/hr"
-        rateColumn.minWidth = 90
-        rateColumn.width = 130
-        outline.addTableColumn(rateColumn)
 
         let scroll = NSScrollView()
         scroll.documentView = outline
@@ -220,7 +213,7 @@ final class BillingHistoryWindowController: NSWindowController {
     private func dayCell(column id: NSUserInterfaceItemIdentifier, row: DayRow) -> NSView {
         switch id {
         case timeColumnID:
-            return makeLabel(
+            makeLabel(
                 Self.dayFormatter.string(from: row.day),
                 font: Theme.titleFont(size: 12),
                 color: Theme.textPrimary
@@ -229,34 +222,19 @@ final class BillingHistoryWindowController: NSWindowController {
             // MTD reflects cumulative *spend* — render neutral, not the accent-mint we use for
             // positive/credit deltas. Otherwise the column reads as "money in" even though it's
             // money out.
-            return makeLabel(
+            makeLabel(
                 NumberFormatting.compactDollars(row.latest),
                 font: Theme.numericFont(size: 12),
                 color: Theme.textPrimary
             )
         case deltaColumnID:
-            return makeLabel(
+            makeLabel(
                 NumberFormatting.compactDollars(row.dayDelta),
                 font: Theme.numericFont(size: 12),
                 color: deltaColor(value: row.dayDelta)
             )
-        case rateColumnID:
-            // Day-level "$/hr" uses sample span / dollar delta for that day.
-            if let firstSample = row.samples.last?.sample,
-               let lastSample = row.samples.first?.sample,
-               lastSample.timestamp > firstSample.timestamp
-            {
-                let secs = lastSample.timestamp.timeIntervalSince(firstSample.timestamp)
-                let perHour = row.dayDelta * 3600 / secs
-                return makeLabel(
-                    NumberFormatting.compactDollars(perHour),
-                    font: Theme.numericFont(size: 12),
-                    color: deltaColor(value: perHour)
-                )
-            }
-            return makeLabel("—", font: Theme.numericFont(size: 12), color: Theme.textTertiary)
         default:
-            return NSView()
+            NSView()
         }
     }
 
@@ -287,20 +265,6 @@ final class BillingHistoryWindowController: NSWindowController {
                 NumberFormatting.compactDollars(delta),
                 font: Theme.numericFont(size: 11),
                 color: deltaColor(value: delta)
-            )
-        case rateColumnID:
-            guard let prior else {
-                return makeLabel("—", font: Theme.numericFont(size: 11), color: Theme.textTertiary)
-            }
-            let elapsed = sample.timestamp.timeIntervalSince(prior.timestamp)
-            guard elapsed > 0 else {
-                return makeLabel("—", font: Theme.numericFont(size: 11), color: Theme.textTertiary)
-            }
-            let perHour = (sample.totalUSD - prior.totalUSD) * 3600 / elapsed
-            return makeLabel(
-                NumberFormatting.compactDollars(perHour),
-                font: Theme.numericFont(size: 11),
-                color: deltaColor(value: perHour)
             )
         default:
             return NSView()

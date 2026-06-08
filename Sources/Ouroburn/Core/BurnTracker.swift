@@ -457,6 +457,16 @@ final class BurnTracker: @unchecked Sendable {
         }
     }
 
+    /// Trigger a normal poll immediately and slide the periodic timer so the next tick is a full
+    /// interval from now. Used on popover-open: the panel shows fresh data without stacking an
+    /// extra poll on top of the already-scheduled one. Unlike `forceRefresh` this keeps the file
+    /// mtime cache (no full reparse) so the open stays cheap. Safe to call from any thread.
+    func refreshAndRescheduleTimer() {
+        queue.async { [weak self] in self?.poll(trigger: .timer) }
+        queue.async { [weak self] in self?.fetchBilling() }
+        timer?.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
+    }
+
     /// Force a poll right now and treat every JSONL on disk as stale so the file mtime cache is
     /// rebuilt from scratch. Also clears the BillingService throttle so the next poll re-hits
     /// `/api/oauth/usage`. Safe to call from any thread.
@@ -769,6 +779,64 @@ final class BurnTracker: @unchecked Sendable {
         let offset = (weekday - cal.firstWeekday + 7) % 7
         let weekStart = cal.date(byAdding: .day, value: -offset, to: cal.startOfDay(for: now)) ?? now
         return oauthSpend(samples: samples, since: weekStart, now: now)
+    }
+
+    /// Forward projection of total billed spend for the current calendar month, from the median
+    /// active-day OAuth burn. Median (not average) so a single heavy day doesn't skew the estimate;
+    /// it stabilizes as more days accumulate. Inactive days drop from the burn sample, which also
+    /// satisfies "ignore weekends unless active" — an idle weekend (or weekday) contributes
+    /// nothing. The forward portion extrapolates over the weekdays remaining in the month plus a
+    /// one-day buffer for today's still-open spend.
+    struct MonthlyProjection: Sendable {
+        let projectedUSD: Double
+        /// Median spend across active days — the per-day burn the projection extrapolates.
+        let dailyBurnUSD: Double
+        let activeDays: Int
+        /// Weekdays remaining through month-end, plus the +1 today buffer.
+        let forwardDays: Int
+    }
+
+    static func monthlyProjection(
+        samples: [BillingSample],
+        monthToDateUSD: Double?,
+        now: Date,
+        calendar: Calendar
+    ) -> MonthlyProjection? {
+        guard let monthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: now)),
+              let dayRange = calendar.range(of: .day, in: .month, for: now) else { return nil }
+        let daysInMonth = dayRange.count
+        let todayDay = calendar.component(.day, from: now) // 1-based index into the month
+
+        // Per-day reset-aware OAuth spend for each elapsed day (day 1 … today).
+        var activeSpends: [Double] = []
+        var mtdFromSamples = 0.0
+        for offset in 0 ..< todayDay {
+            guard let dayStart = calendar.date(byAdding: .day, value: offset, to: monthStart) else { continue }
+            let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? now
+            let spend = oauthSpend(samples: samples, since: dayStart, now: min(dayEnd, now)) ?? 0
+            mtdFromSamples += spend
+            if spend > 0.005 { activeSpends.append(spend) }
+        }
+        guard !activeSpends.isEmpty else { return nil }
+        let dailyBurn = median(of: activeSpends)
+
+        // Remaining billable days: weekdays strictly after today through month-end, +1 for today.
+        var remainingWeekdays = 0
+        if todayDay < daysInMonth {
+            for day in (todayDay + 1) ... daysInMonth {
+                guard let date = calendar.date(byAdding: .day, value: day - 1, to: monthStart) else { continue }
+                let weekday = calendar.component(.weekday, from: date)
+                if weekday != 1, weekday != 7 { remainingWeekdays += 1 } // skip Sun(1)/Sat(7)
+            }
+        }
+        let forwardDays = remainingWeekdays + 1
+        let base = monthToDateUSD ?? mtdFromSamples
+        return MonthlyProjection(
+            projectedUSD: base + dailyBurn * Double(forwardDays),
+            dailyBurnUSD: dailyBurn,
+            activeDays: activeSpends.count,
+            forwardDays: forwardDays
+        )
     }
 
     /// Newest OAuth sample older than this → no fresh signal → spinner idles green. Generous
