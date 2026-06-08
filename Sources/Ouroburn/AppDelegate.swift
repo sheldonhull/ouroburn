@@ -167,6 +167,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     Log.info(Log.app, "Snapshot cache reset by user")
                     self?.tracker?.setMode(.day)
                 },
+                onResetLocalData: { [weak self] in
+                    Log.info(Log.app, "Local session data reset by user")
+                    self?.tracker?.resetLocalSessionData()
+                },
                 onPreferencesSaved: { [weak self] prefs in
                     Log.info(Log.app, "Preferences saved")
                     self?.tracker?.applyPreferences(prefs)

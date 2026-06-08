@@ -41,6 +41,8 @@ struct CachedSnapshot: Codable, Sendable {
         let models: [CachedModel]
         let isActive: Bool
         let isGap: Bool
+        /// Added after the initial schema — optional so older snapshot files still decode.
+        var cwd: String? = nil
     }
 
     struct CachedModel: Codable, Sendable {
@@ -124,7 +126,8 @@ extension CachedSnapshot.CachedBucket {
             costUSD: bucket.costUSD,
             models: bucket.models.map(CachedSnapshot.CachedModel.init),
             isActive: bucket.isActive,
-            isGap: bucket.isGap
+            isGap: bucket.isGap,
+            cwd: bucket.cwd
         )
     }
 
@@ -141,7 +144,8 @@ extension CachedSnapshot.CachedBucket {
             costUSD: costUSD,
             models: models.map { $0.toModelBreakdown() },
             isActive: isActive,
-            isGap: isGap
+            isGap: isGap,
+            cwd: cwd
         )
     }
 }

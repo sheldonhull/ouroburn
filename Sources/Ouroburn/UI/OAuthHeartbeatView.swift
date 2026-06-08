@@ -27,6 +27,13 @@ final class OAuthHeartbeatView: NSView {
         let label: String
     }
 
+    /// An x-axis tick: which slot it sits at (0-based into the fixed slot domain) plus a relative
+    /// "{ago}" label so the timeframe reads at a glance.
+    fileprivate struct Tick {
+        let slotIndex: Int
+        let label: String
+    }
+
     private var allSamples: [BillingSample] = []
     private var range: Range = .month
     private var beats: [Beat] = []
@@ -62,20 +69,25 @@ final class OAuthHeartbeatView: NSView {
     }
 
     private func rebuild() {
-        beats = Self.buildBeats(samples: allSamples, range: range, now: Date(), calendar: .current)
-        canvas.update(beats: beats)
+        let now = Date()
+        let calendar = Calendar.current
+        let allBuckets = Self.buckets(for: range, now: now, calendar: calendar)
+        beats = Self.buildBeats(buckets: allBuckets, samples: allSamples, now: now)
+        // slotCount fixes the x-axis to the full range (e.g. the whole calendar month) so the
+        // plot doesn't grow as days accrue — it fills left-to-right inside a stable frame.
+        let ticks = Self.ticks(beats: beats, range: range, now: now, calendar: calendar)
+        canvas.update(beats: beats, slotCount: allBuckets.count, ticks: ticks)
         renderHeader()
     }
 
-    /// One beat per time bucket, each carrying that bucket's reset-aware OAuth spend. Bucketing:
-    /// hourly across today, weekly across the current month, or one bar per day of the month.
+    /// One beat per elapsed time bucket, each carrying that bucket's reset-aware OAuth spend.
+    /// Future buckets (e.g. days later this month) are skipped here but still count toward the
+    /// plot's fixed slot domain so the curve fills a stable frame rather than stretching.
     private static func buildBeats(
+        buckets: [(start: Date, end: Date, label: String)],
         samples: [BillingSample],
-        range: Range,
-        now: Date,
-        calendar: Calendar
+        now: Date
     ) -> [Beat] {
-        let buckets = Self.buckets(for: range, now: now, calendar: calendar)
         var raw: [(date: Date, spend: Double, label: String)] = []
         raw.reserveCapacity(buckets.count)
         for bucket in buckets {
@@ -113,9 +125,10 @@ final class OAuthHeartbeatView: NSView {
     }
 
     /// `(start, end, label)` buckets for the range. Today → 24 hourly bars of the current day;
-    /// week → one bar per day over the trailing 7 days; month → one bar per day over the trailing
-    /// 30 days. Week/month use trailing windows rather than calendar boundaries so the graph still
-    /// shows the OAuth history early in a month (a calendar-month view is a single bar on the 1st).
+    /// week → one bar per day over the trailing 7 days; month → one bar per day across the *full*
+    /// calendar month (1st → last day). The month frame is fixed so the plot doesn't grow as the
+    /// month progresses — future days are reserved empty slots the curve fills into. `buildBeats`
+    /// drops the future buckets from the line while `slotCount` keeps the x-axis pinned.
     private static func buckets(
         for range: Range,
         now: Date,
@@ -134,7 +147,24 @@ final class OAuthHeartbeatView: NSView {
         case .week:
             return dailyBuckets(daysBack: 7, now: now, calendar: calendar)
         case .month:
-            return dailyBuckets(daysBack: 30, now: now, calendar: calendar)
+            return monthBuckets(now: now, calendar: calendar)
+        }
+    }
+
+    /// One bar per day across the whole current calendar month (1st … last day), oldest first.
+    /// Fixed-length so the month view's x-axis stays put while bars fill in day by day.
+    private static func monthBuckets(
+        now: Date,
+        calendar: Calendar
+    ) -> [(start: Date, end: Date, label: String)] {
+        guard let monthStart = calendar.date(from: calendar.dateComponents([.year, .month], from: now)),
+              let dayRange = calendar.range(of: .day, in: .month, for: now) else { return [] }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMM d"
+        return (0 ..< dayRange.count).compactMap { offset in
+            guard let start = calendar.date(byAdding: .day, value: offset, to: monthStart),
+                  let end = calendar.date(byAdding: .day, value: 1, to: start) else { return nil }
+            return (start, end, fmt.string(from: start))
         }
     }
 
@@ -154,11 +184,49 @@ final class OAuthHeartbeatView: NSView {
         }
     }
 
+    /// Up to 5 evenly spaced x-axis ticks across the elapsed beats, labeled with relative age.
+    /// The rightmost lands on the most recent bucket ("today" / "now"), so the labels read as a
+    /// timeframe scale ending at the present.
+    private static func ticks(
+        beats: [Beat],
+        range: Range,
+        now: Date,
+        calendar: Calendar
+    ) -> [Tick] {
+        guard beats.count >= 2 else { return [] }
+        let lastIdx = beats.count - 1
+        let desired = min(5, beats.count)
+        var seen = Set<Int>()
+        return (0 ..< desired).compactMap { k -> Tick? in
+            let idx = Int((Double(k) / Double(desired - 1) * Double(lastIdx)).rounded())
+            guard seen.insert(idx).inserted else { return nil }
+            return Tick(
+                slotIndex: idx,
+                label: agoLabel(beats[idx].timestamp, now: now, range: range, calendar: calendar)
+            )
+        }
+    }
+
+    private static func agoLabel(_ date: Date, now: Date, range: Range, calendar: Calendar) -> String {
+        switch range {
+        case .today:
+            let hours = Int(now.timeIntervalSince(date) / 3600)
+            return hours <= 0 ? "now" : "\(hours)h ago"
+        case .week, .month:
+            let days = calendar.dateComponents(
+                [.day],
+                from: calendar.startOfDay(for: date),
+                to: calendar.startOfDay(for: now)
+            ).day ?? 0
+            return days <= 0 ? "today" : "\(days)d ago"
+        }
+    }
+
     private func renderHeader() {
         titleLabel.attributedStringValue = Theme.glowAttributedTitle(
             "OAuth billing · \(range.title)",
             color: Theme.accentMint,
-            font: Theme.titleFont(size: 12)
+            font: Theme.titleFont(size: 14)
         )
     }
 
@@ -184,6 +252,10 @@ final class OAuthHeartbeatView: NSView {
 @MainActor
 private final class HeartbeatCanvas: NSView {
     private var beats: [OAuthHeartbeatView.Beat] = []
+    /// Fixed x-axis length (e.g. all days in the month). The line only spans the elapsed beats but
+    /// is laid out against this domain so the plot keeps a stable width as days fill in.
+    private var slotCount = 0
+    private var ticks: [OAuthHeartbeatView.Tick] = []
     private var positions: [CGPoint] = []
     private var hoveredIndex: Int?
     private var trackingArea: NSTrackingArea?
@@ -211,11 +283,18 @@ private final class HeartbeatCanvas: NSView {
         fatalError("not used")
     }
 
-    func update(beats next: [OAuthHeartbeatView.Beat]) {
+    func update(beats next: [OAuthHeartbeatView.Beat], slotCount: Int, ticks: [OAuthHeartbeatView.Tick]) {
         beats = next
+        self.slotCount = max(slotCount, next.count)
+        self.ticks = ticks
         hoveredIndex = nil
         tooltip.isHidden = true
         needsDisplay = true
+    }
+
+    /// Divisor for the fixed x-axis: full slot domain when known, else the beat count.
+    private var xStrideDivisor: CGFloat {
+        CGFloat(max(slotCount - 1, max(beats.count - 1, 1)))
     }
 
     override func updateTrackingAreas() {
@@ -249,7 +328,7 @@ private final class HeartbeatCanvas: NSView {
             needsDisplay = true
             return
         }
-        let stride = plot.width / CGFloat(max(beats.count - 1, 1))
+        let stride = plot.width / xStrideDivisor
         let idx = Int(round((position.x - plot.minX) / stride))
         let clamped = min(max(idx, 0), beats.count - 1)
         hoveredIndex = clamped
@@ -272,13 +351,54 @@ private final class HeartbeatCanvas: NSView {
         }
         positions = computePositions(rect: plot)
         drawSparkline(in: ctx, rect: plot)
+        drawTicks(in: ctx, rect: plot)
         if let hoveredIndex {
             drawHoverIndicator(in: ctx, rect: plot, index: hoveredIndex)
         }
     }
 
+    /// Vertical room reserved below the plot for the "{ago}" tick labels.
+    private static let axisLabelHeight: CGFloat = 13
+
     private func plotRect() -> NSRect {
-        bounds.insetBy(dx: 0, dy: 4)
+        NSRect(
+            x: bounds.minX,
+            y: bounds.minY + Self.axisLabelHeight,
+            width: bounds.width,
+            height: max(bounds.height - Self.axisLabelHeight - 4, 1)
+        )
+    }
+
+    /// Tick marks + relative-age labels along the x-axis, positioned against the fixed slot domain
+    /// so a glance reads the timeframe ("30d ago … today"). Early in a month the elapsed beats
+    /// bunch into the left of a wide frame, so labels are placed right-to-left ("today" always
+    /// wins) and any that would collide are dropped — only the tick mark stays.
+    private func drawTicks(in ctx: CGContext, rect: NSRect) {
+        guard !ticks.isEmpty else { return }
+        let stride = rect.width / xStrideDivisor
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: Theme.bodyFont(size: 8),
+            .foregroundColor: Theme.textTertiary
+        ]
+        let gap: CGFloat = 6
+        var nextLabelLimit = CGFloat.greatestFiniteMagnitude
+        ctx.saveGState()
+        ctx.setStrokeColor(Theme.divider.cgColor)
+        ctx.setLineWidth(0.5)
+        for tick in ticks.reversed() {
+            let x = rect.minX + stride * CGFloat(tick.slotIndex)
+            ctx.move(to: CGPoint(x: x, y: rect.minY))
+            ctx.addLine(to: CGPoint(x: x, y: rect.minY - 3))
+            ctx.strokePath()
+
+            let text = NSAttributedString(string: tick.label, attributes: attrs)
+            let size = text.size()
+            let labelX = min(max(x - size.width / 2, bounds.minX), bounds.maxX - size.width)
+            guard labelX + size.width <= nextLabelLimit else { continue }
+            text.draw(at: CGPoint(x: labelX, y: rect.minY - Self.axisLabelHeight))
+            nextLabelLimit = labelX - gap
+        }
+        ctx.restoreGState()
     }
 
     private func drawZeroLine(in ctx: CGContext, rect: NSRect) {
@@ -307,7 +427,7 @@ private final class HeartbeatCanvas: NSView {
     private func computePositions(rect: NSRect) -> [CGPoint] {
         // $1 floor keeps placid periods from amplifying noise.
         let peak = max(beats.map { abs($0.smoothed) }.max() ?? 0, 1)
-        let stride = rect.width / CGFloat(max(beats.count - 1, 1))
+        let stride = rect.width / xStrideDivisor
         return beats.enumerated().map { index, beat in
             let x = rect.minX + stride * CGFloat(index)
             let normalized = CGFloat(beat.smoothed / peak)
@@ -445,15 +565,15 @@ private final class HeartbeatTooltip: NSView {
         layer?.shadowRadius = 8
         layer?.shadowOffset = .zero
 
-        timeLabel.font = Theme.numericFont(size: 11)
+        timeLabel.font = Theme.numericFont(size: 13)
         timeLabel.textColor = Theme.textPrimary
         timeLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        deltaLabel.font = Theme.numericFont(size: 11)
+        deltaLabel.font = Theme.numericFont(size: 14)
         deltaLabel.textColor = Theme.accentPeach
         deltaLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        mtdLabel.font = Theme.bodyFont(size: 10)
+        mtdLabel.font = Theme.bodyFont(size: 12)
         mtdLabel.textColor = Theme.textSecondary
         mtdLabel.translatesAutoresizingMaskIntoConstraints = false
 

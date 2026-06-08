@@ -36,6 +36,17 @@ enum ProjectPath {
         return Array(common.prefix(max(0, shortest - 1)))
     }
 
+    /// Human-readable directory leaf for a session/project. Prefers the transcript's recorded
+    /// `cwd` (accurate even when a directory name contains hyphens) and falls back to the last
+    /// segment of the `-`-decoded project key. Returns nil only when neither yields a name.
+    static func directoryLeaf(cwd: String?, project: String) -> String? {
+        if let cwd, !cwd.isEmpty {
+            let leaf = (cwd as NSString).lastPathComponent
+            if !leaf.isEmpty, leaf != "/" { return leaf }
+        }
+        return segments(project).last
+    }
+
     /// Splits `<projectKey>/<sessionId>` produced by `Aggregator.groupBySession`.
     static func splitSessionBucketID(_ id: String) -> (project: String, session: String)? {
         guard let slash = id.lastIndex(of: "/") else { return nil }

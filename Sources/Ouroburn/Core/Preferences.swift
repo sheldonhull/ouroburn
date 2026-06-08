@@ -28,7 +28,7 @@ struct Preferences: Sendable {
     static let `default` = Preferences(
         spikeMultiplier: 2.0,
         spikeMinimumRate: 500,
-        defaultMode: .day,
+        defaultMode: .session,
         notificationCooldownSeconds: 600,
         oauthRefreshMinutes: 5,
         toastEnabled: false,

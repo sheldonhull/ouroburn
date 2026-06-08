@@ -228,7 +228,8 @@ struct JSONLLoader {
             requestId: line.requestId,
             costUSD: line.costUSD,
             projectPath: project,
-            sessionId: session
+            sessionId: session,
+            cwd: line.cwd
         )
     }
 
@@ -255,6 +256,7 @@ private struct RawLine: Decodable {
     let timestamp: String?
     let requestId: String?
     let costUSD: Double?
+    let cwd: String?
     let message: Message?
 
     var parsedTimestamp: Date? {
