@@ -240,15 +240,25 @@ struct JSONLLoader {
     }
 
     /// `<root>/projects/<project>/<session>.jsonl` → (project, sessionId).
+    ///
+    /// Subagent transcripts live one level deeper at
+    /// `<project>/<session>/subagents/agent-<id>.jsonl`. Left as-is they'd surface as a row whose
+    /// project key ends in `…/<session>/subagents` and whose session is an opaque `agent-<id>` —
+    /// no hint which real session spawned the work. Re-attribute them to the parent session so the
+    /// cost folds into that session's row (dedup keys differ, so no double count).
     static func deriveProjectAndSession(from url: URL) -> (project: String, session: String) {
-        let session = url.deletingPathExtension().lastPathComponent
-        let parent = url.deletingLastPathComponent()
-        let parents = parent.pathComponents
+        var session = url.deletingPathExtension().lastPathComponent
+        var parents = url.deletingLastPathComponent().pathComponents
+        if parents.last == "subagents", parents.count >= 2 {
+            parents.removeLast() // drop the "subagents" dir
+            session = parents.removeLast() // parent session id becomes the session
+        }
         if let idx = parents.lastIndex(of: "projects"), idx + 1 < parents.count {
             let project = parents[(idx + 1)...].joined(separator: "/")
             return (project.isEmpty ? "Unknown Project" : project, session)
         }
-        return (parent.lastPathComponent.isEmpty ? "Unknown Project" : parent.lastPathComponent, session)
+        let leaf = parents.last ?? ""
+        return (leaf.isEmpty ? "Unknown Project" : leaf, session)
     }
 }
 

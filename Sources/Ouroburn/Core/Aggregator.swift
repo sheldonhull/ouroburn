@@ -7,18 +7,32 @@ import Foundation
 /// project + session id — per ccusage `data-loader.ts:961-989`. The 5-hour block view delegates
 /// to `SessionBlockBuilder`.
 struct Aggregator {
-    let pricing: [String: ModelPricing]
+    let pricing: DatedPricingTable
     let calendar: Calendar
     let weekStart: Int
 
     init(
-        pricing: [String: ModelPricing],
+        pricing: DatedPricingTable,
         calendar: Calendar = .current,
         weekStart: Int = 1
     ) {
         self.pricing = pricing
         self.calendar = calendar
         self.weekStart = weekStart
+    }
+
+    /// Convenience for callers (and tests) holding a single flat table with no version history —
+    /// every entry prices against `table` regardless of timestamp.
+    init(
+        pricing table: [String: ModelPricing],
+        calendar: Calendar = .current,
+        weekStart: Int = 1
+    ) {
+        self.init(
+            pricing: DatedPricingTable(versions: [], current: table),
+            calendar: calendar,
+            weekStart: weekStart
+        )
     }
 
     func aggregate(entries: [UsageEntry], mode: ViewMode, now: Date = Date()) -> [AggregateBucket] {
@@ -33,7 +47,8 @@ struct Aggregator {
 
     func cost(of entry: UsageEntry) -> Double {
         if let cost = entry.costUSD { return cost }
-        return PricingResolver.resolve(model: entry.model, table: pricing)?.cost(for: entry) ?? 0
+        // Price at the rate effective when the usage happened, not today's rate.
+        return pricing.resolve(model: entry.model, at: entry.timestamp)?.cost(for: entry) ?? 0
     }
 
     /// Time-axis samples for the line graph. Granularity scales with the view mode:
@@ -199,10 +214,11 @@ private extension Calendar {
 enum PricingResolver {
     static func resolve(model: String?, table: [String: ModelPricing]) -> ModelPricing? {
         guard let model, !model.isEmpty else { return nil }
+        let normalized = PricingService.normalizeModelName(model)
         for prefix in PricingService.prefixCandidates {
-            if let hit = table[prefix + model] { return hit }
+            if let hit = table[prefix + normalized] { return hit }
         }
-        return PricingService.fuzzyMatch(model, in: table)
+        return PricingService.fuzzyMatch(normalized, in: table)
     }
 }
 

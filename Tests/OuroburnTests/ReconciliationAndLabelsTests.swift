@@ -69,7 +69,6 @@ struct ReconciliationAndLabelsTests {
             monthTokens: 0,
             monthCostUSD: monthCostUSD,
             updatedAt: Date(),
-            spikeDetected: false,
             stale: false,
             billedMonthUSD: billedMonthUSD,
             billingStatusMessage: nil,
@@ -80,16 +79,16 @@ struct ReconciliationAndLabelsTests {
         )
     }
 
-    @Test("Other = OAuth-billed month minus local estimate (positive)")
+    @Test("Other (est. remote) = OAuth-billed month minus local estimate when billed is higher")
     func otherMonthPositive() {
         let snap = snapshot(billedMonthUSD: 50, monthCostUSD: 30)
         #expect(snap.otherMonthUSD == 20)
     }
 
-    @Test("Other is negative when the local estimate exceeds billed spend")
-    func otherMonthNegative() {
+    @Test("Other clamps to 0 when the local estimate exceeds billed spend (no negative)")
+    func otherMonthClampsToZero() {
         let snap = snapshot(billedMonthUSD: 10, monthCostUSD: 42)
-        #expect(snap.otherMonthUSD == -32)
+        #expect(snap.otherMonthUSD == 0)
     }
 
     @Test("Other is nil until an OAuth month figure exists")

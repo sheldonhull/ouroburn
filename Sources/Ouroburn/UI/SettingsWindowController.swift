@@ -7,21 +7,22 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let onResetCache: () -> Void
     private let onResetLocalData: () -> Void
     private let onPreferencesSaved: (Preferences) -> Void
+    /// Manual pricing-feed refetch. Hands back the new load time (nil on failure) so the button
+    /// can surface freshness. The completion is delivered off the main thread.
+    private let onRefreshPricing: (@escaping @Sendable (Date?) -> Void) -> Void
 
     private let oauthField = NSSecureTextField()
     private let adminField = NSSecureTextField()
     private let oauthIndicator = StatusDot()
     private let adminIndicator = StatusDot()
-    private let multiplierField = NSTextField()
-    private let minRateField = NSTextField()
     private let cooldownField = NSTextField()
     private let oauthIntervalField = NSTextField()
     private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let toastEnabledSwitch = NSSwitch()
-    private let toastThresholdField = NSTextField()
-    private let toastSustainedField = NSTextField()
     private let toastPeakAlertSwitch = NSSwitch()
     private let toastPeakMinimumField = NSTextField()
+    private let projectionEnabledSwitch = NSSwitch()
+    private let projectionThresholdField = NSTextField()
+    private let projectionMinTodayField = NSTextField()
     private let launchAtLoginSwitch = NSSwitch()
     private let toastPreviewButton = NSButton(title: "Preview", target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
@@ -32,13 +33,15 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         cacheURL: URL,
         onResetCache: @escaping () -> Void,
         onResetLocalData: @escaping () -> Void,
-        onPreferencesSaved: @escaping (Preferences) -> Void
+        onPreferencesSaved: @escaping (Preferences) -> Void,
+        onRefreshPricing: @escaping (@escaping @Sendable (Date?) -> Void) -> Void
     ) {
         self.logFolderURL = logFolderURL
         self.cacheURL = cacheURL
         self.onResetCache = onResetCache
         self.onResetLocalData = onResetLocalData
         self.onPreferencesSaved = onPreferencesSaved
+        self.onRefreshPricing = onRefreshPricing
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 720, height: 940),
@@ -286,14 +289,6 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private func makeThresholdsCard() -> NSView {
         let card = card(title: "Tuning", subtitle: nil)
 
-        multiplierField.translatesAutoresizingMaskIntoConstraints = false
-        multiplierField.placeholderString = "2.0"
-        multiplierField.alignment = .right
-
-        minRateField.translatesAutoresizingMaskIntoConstraints = false
-        minRateField.placeholderString = "500"
-        minRateField.alignment = .right
-
         cooldownField.translatesAutoresizingMaskIntoConstraints = false
         cooldownField.placeholderString = "600"
         cooldownField.alignment = .right
@@ -309,9 +304,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         }
 
         let stack = NSStackView(views: [
-            inlineRow("Spike multiplier", control: multiplierField, hint: "live > median × X"),
-            inlineRow("Spike floor (tk/m)", control: minRateField, hint: "ignore below this"),
-            inlineRow("Notification cooldown (s)", control: cooldownField, hint: "min 60"),
+            inlineRow("Alert cooldown (s)", control: cooldownField, hint: "min 60 between toasts"),
             inlineRow(
                 "OAuth refresh (min)",
                 control: oauthIntervalField,
@@ -333,29 +326,27 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         return card
     }
 
-    /// In-app toast alerts, separated from the macOS notification "spike" path. The Tuning card
-    /// drives the (existing) NSUserNotification; this card drives the floating in-app toast — two
-    /// distinct signals so users can run one without the other.
+    /// In-app toast alerts. Two independent signals, both delivered as the floating on-screen toast
+    /// (no macOS Notification Center): a new daily peak in OAuth spend rate, and a month-end spend
+    /// projection crossing the budget ceiling.
     private func makeAlertsCard() -> NSView {
         let card = card(title: "Alerts", subtitle: nil)
-
-        toastEnabledSwitch.translatesAutoresizingMaskIntoConstraints = false
-        toastEnabledSwitch.target = self
-        toastEnabledSwitch.action = #selector(toastEnabledChanged(_:))
-
-        toastThresholdField.translatesAutoresizingMaskIntoConstraints = false
-        toastThresholdField.placeholderString = "8.00"
-        toastThresholdField.alignment = .right
-
-        toastSustainedField.translatesAutoresizingMaskIntoConstraints = false
-        toastSustainedField.placeholderString = "30"
-        toastSustainedField.alignment = .right
 
         toastPeakAlertSwitch.translatesAutoresizingMaskIntoConstraints = false
 
         toastPeakMinimumField.translatesAutoresizingMaskIntoConstraints = false
         toastPeakMinimumField.placeholderString = "5.00"
         toastPeakMinimumField.alignment = .right
+
+        projectionEnabledSwitch.translatesAutoresizingMaskIntoConstraints = false
+
+        projectionThresholdField.translatesAutoresizingMaskIntoConstraints = false
+        projectionThresholdField.placeholderString = "7000"
+        projectionThresholdField.alignment = .right
+
+        projectionMinTodayField.translatesAutoresizingMaskIntoConstraints = false
+        projectionMinTodayField.placeholderString = "200"
+        projectionMinTodayField.alignment = .right
 
         toastPreviewButton.bezelStyle = .rounded
         toastPreviewButton.controlSize = .small
@@ -365,15 +356,23 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         toastPreviewButton.translatesAutoresizingMaskIntoConstraints = false
 
         let stack = NSStackView(views: [
-            inlineRow("Show toast", control: toastEnabledSwitch, hint: "fires only while ouroburn is running"),
-            inlineRow("Threshold ($/hr)", control: toastThresholdField, hint: "live USD/hr ≥ this"),
-            inlineRow("Sustained (s)", control: toastSustainedField, hint: "must hold for at least"),
             inlineRow(
                 "Alert on new daily peak",
                 control: toastPeakAlertSwitch,
-                hint: "fires when an OAuth sample beats today's prior max $/hr"
+                hint: "today's peak spend rate — last sample $ + period"
             ),
             inlineRow("Peak floor ($/hr)", control: toastPeakMinimumField, hint: "ignore peaks below this"),
+            inlineRow(
+                "Alert on month projection",
+                control: projectionEnabledSwitch,
+                hint: "once/day when projected spend crosses budget"
+            ),
+            inlineRow("Budget ($/month)", control: projectionThresholdField, hint: "projected spend > this"),
+            inlineRow(
+                "Quiet until today ($)",
+                control: projectionMinTodayField,
+                hint: "only after today's spend passes this"
+            ),
             inlineRow("Preview", control: toastPreviewButton, hint: "fires a sample toast now")
         ])
         stack.orientation = .vertical
@@ -390,15 +389,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         return card
     }
 
-    @objc private func toastEnabledChanged(_: Any?) {
-        // No-op: persistence happens on Save. Preview button stays usable regardless of state.
-    }
-
     @objc private func previewToastPressed(_: Any?) {
-        let threshold = Double(toastThresholdField.stringValue) ?? Preferences.default.toastCostThresholdUSDPerHour
         ToastWindow.show(
-            title: "Burn rate alert (preview)",
-            message: "Sustained > \(NumberFormatting.compactRate(dollarsPerHour: threshold)) threshold · sample toast"
+            title: "Today's peak spend rate (preview)",
+            message: "$0.85 in last 6 min · $214 today · sample toast",
+            accent: Theme.accentRed
         )
     }
 
@@ -435,14 +430,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let revealLogs = makeButton(title: "Reveal logs", action: #selector(revealLogFolder(_:)))
         let resetCache = makeButton(title: "Reset cache", action: #selector(resetCache(_:)))
         let resetLocal = makeButton(title: "Reset local session data", action: #selector(resetLocalData(_:)))
-        let actions = NSStackView(views: [revealLogs, resetCache, resetLocal])
+        let refreshPricing = makeButton(title: "Refresh model pricing", action: #selector(refreshPricingPressed(_:)))
+        let actions = NSStackView(views: [revealLogs, resetCache, resetLocal, refreshPricing])
         actions.orientation = .horizontal
         actions.spacing = 8
         actions.translatesAutoresizingMaskIntoConstraints = false
 
         let hint = NSTextField(wrappingLabelWithString:
             "“Reset local session data” clears the snapshot + parsed-transcript caches and "
-                + "re-reads the JSONL from disk. OAuth-tracked billing history is left untouched.")
+                + "re-reads the JSONL from disk. OAuth-tracked billing history is left untouched. "
+                + "“Refresh model pricing” refetches the models.dev feed now — use it when a new "
+                + "model shows $0.")
         hint.font = Theme.bodyFont(size: 10)
         hint.textColor = Theme.textTertiary
         hint.translatesAutoresizingMaskIntoConstraints = false
@@ -558,15 +556,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private func loadFromStore() {
         let prefs = PreferencesStore.load()
-        multiplierField.stringValue = String(format: "%.2f", prefs.spikeMultiplier)
-        minRateField.stringValue = String(Int(prefs.spikeMinimumRate))
         cooldownField.stringValue = String(Int(prefs.notificationCooldownSeconds))
         oauthIntervalField.stringValue = String(Int(prefs.oauthRefreshMinutes))
-        toastEnabledSwitch.state = prefs.toastEnabled ? .on : .off
-        toastThresholdField.stringValue = String(format: "%.2f", prefs.toastCostThresholdUSDPerHour)
-        toastSustainedField.stringValue = String(Int(prefs.toastSustainedSeconds))
         toastPeakAlertSwitch.state = prefs.toastPeakAlertEnabled ? .on : .off
         toastPeakMinimumField.stringValue = String(format: "%.2f", prefs.toastPeakMinimumUSDPerHour)
+        projectionEnabledSwitch.state = prefs.monthlyProjectionAlertEnabled ? .on : .off
+        projectionThresholdField.stringValue = String(Int(prefs.monthlyProjectionThresholdUSD))
+        projectionMinTodayField.stringValue = String(Int(prefs.monthlyProjectionMinTodayUSD))
         launchAtLoginSwitch.state = LaunchAtLogin.isEnabled() ? .on : .off
         if let index = ViewMode.allCases.firstIndex(of: prefs.defaultMode) {
             modePopup.selectItem(at: index)
@@ -581,30 +577,26 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc private func savePressed() {
-        let multiplier = Double(multiplierField.stringValue) ?? Preferences.default.spikeMultiplier
-        let minRate = Double(minRateField.stringValue) ?? Preferences.default.spikeMinimumRate
         let cooldown = Double(cooldownField.stringValue) ?? Preferences.default.notificationCooldownSeconds
         let oauthInterval = Double(oauthIntervalField.stringValue) ?? Preferences.default.oauthRefreshMinutes
         let mode = ViewMode.allCases[modePopup.indexOfSelectedItem]
-        let toastThreshold = Double(toastThresholdField.stringValue)
-            ?? Preferences.default.toastCostThresholdUSDPerHour
-        let toastSustained = Double(toastSustainedField.stringValue)
-            ?? Preferences.default.toastSustainedSeconds
         let toastPeakMinimum = Double(toastPeakMinimumField.stringValue)
             ?? Preferences.default.toastPeakMinimumUSDPerHour
+        let projectionThreshold = Double(projectionThresholdField.stringValue)
+            ?? Preferences.default.monthlyProjectionThresholdUSD
+        let projectionMinToday = Double(projectionMinTodayField.stringValue)
+            ?? Preferences.default.monthlyProjectionMinTodayUSD
 
         let wantsLaunchAtLogin = launchAtLoginSwitch.state == .on
         let prefs = Preferences(
-            spikeMultiplier: max(1.05, multiplier),
-            spikeMinimumRate: max(0, minRate),
             defaultMode: mode,
             notificationCooldownSeconds: max(60, cooldown),
             oauthRefreshMinutes: min(max(1, oauthInterval), 60),
-            toastEnabled: toastEnabledSwitch.state == .on,
-            toastCostThresholdUSDPerHour: max(0.1, toastThreshold),
-            toastSustainedSeconds: min(max(5, toastSustained), 600),
             toastPeakAlertEnabled: toastPeakAlertSwitch.state == .on,
             toastPeakMinimumUSDPerHour: max(0, toastPeakMinimum),
+            monthlyProjectionAlertEnabled: projectionEnabledSwitch.state == .on,
+            monthlyProjectionThresholdUSD: max(0, projectionThreshold),
+            monthlyProjectionMinTodayUSD: max(0, projectionMinToday),
             launchAtLoginEnabled: wantsLaunchAtLogin
         )
         PreferencesStore.save(prefs)
@@ -664,6 +656,24 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         statusLabel.stringValue = "Local session data reset — reloading transcripts from disk"
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
             self?.statusLabel.stringValue = " "
+        }
+    }
+
+    @objc private func refreshPricingPressed(_: Any?) {
+        statusLabel.stringValue = "Refreshing model pricing…"
+        onRefreshPricing { date in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let date {
+                    let age = Int(Date().timeIntervalSince(date))
+                    statusLabel.stringValue = "Pricing refreshed (\(age)s ago)"
+                } else {
+                    statusLabel.stringValue = "Pricing refresh failed — keeping cached rates"
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                    self?.statusLabel.stringValue = " "
+                }
+            }
         }
     }
 }

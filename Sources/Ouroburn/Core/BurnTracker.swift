@@ -40,7 +40,6 @@ struct TrackerSnapshot: Sendable {
     let monthCostUSD: Double
 
     let updatedAt: Date
-    let spikeDetected: Bool
     let stale: Bool
 
     /// Optional billed-cost figure from Anthropic admin API. Nil unless the user has set
@@ -88,7 +87,12 @@ struct TrackerSnapshot: Sendable {
     /// OAuth month figure exists, so callers can show a placeholder instead of a misleading $0.
     var otherMonthUSD: Double? {
         guard let billed = billedMonthUSD else { return nil }
-        return billed - monthCostUSD
+        // Estimated remote spend = how much more Anthropic billed this month than the local
+        // transcripts account for (usage outside Claude Code, or pricing the local estimate
+        // underrates). Clamped at 0: when the local list-price estimate momentarily exceeds billed
+        // — `extra_used_usd` lags local work intraday — there's no unexplained remote spend to show,
+        // not a negative.
+        return max(0, billed - monthCostUSD)
     }
 
     var buckets: [AggregateBucket] {
@@ -130,7 +134,6 @@ struct TrackerSnapshot: Sendable {
             monthTokens: monthTokens,
             monthCostUSD: monthCostUSD,
             updatedAt: updatedAt,
-            spikeDetected: spikeDetected,
             stale: stale,
             billedMonthUSD: billedMonthUSD,
             billingStatusMessage: billingStatusMessage,
@@ -162,25 +165,33 @@ struct LiveSnapshot: Sendable {
     let perSession: [SessionVelocity]
 }
 
-/// Fires when the live USD/hr stays at or above the user's threshold for at least
-/// `Preferences.toastSustainedSeconds`. Carries the breach value plus the top session so the UI
-/// layer can render a "what's burning" message without re-deriving it.
-struct ToastEvent: Sendable {
-    enum Kind: Sendable {
-        case threshold
-        case dailyPeak
+/// Alert payload handed to the UI layer for an on-screen toast. Two shapes:
+///   - `dailyPeak`: a fresh high in today's per-interval OAuth spend rate. Carries the last
+///     sample's dollars and the period it covered so the toast can read "today's peak spend rate".
+///   - `monthlyProjection`: the month-end spend projection has crossed the user's budget ceiling.
+enum ToastEvent: Sendable {
+    case dailyPeak(DailyPeak)
+    case monthlyProjection(MonthlyProjectionAlert)
+
+    /// New high in today's OAuth spend rate. `sampleUSD` over `sampleSeconds` is the most recent
+    /// billed interval; `peakUSDPerHour` is that interval annualized to a rate. `todayCostUSD` is
+    /// the day's spend at fire time (OAuth delta when available, else JSONL).
+    struct DailyPeak: Sendable {
+        let sampleUSD: Double
+        let sampleSeconds: TimeInterval
+        let peakUSDPerHour: Double
+        let topSession: SessionVelocity?
+        let todayCostUSD: Double
     }
 
-    let kind: Kind
-    let costPerHour: Double
-    let thresholdUSDPerHour: Double
-    let topSession: SessionVelocity?
-    let firstBreachAt: Date
-    /// Today's prior peak delta-derived $/hr — populated only for `dailyPeak` events.
-    let previousPeakUSDPerHour: Double?
-    /// Today's spend at fire time — OAuth midnight-delta when available, else JSONL estimate.
-    /// Stable headline figure that doesn't whipsaw like $/hr.
-    let todayCostUSD: Double
+    /// Month-end spend projection crossed `thresholdUSD`. `dailyBurnUSD` is the median active-day
+    /// burn driving the projection; `todayCostUSD` is the day's spend at fire time.
+    struct MonthlyProjectionAlert: Sendable {
+        let projectedUSD: Double
+        let thresholdUSD: Double
+        let dailyBurnUSD: Double
+        let todayCostUSD: Double
+    }
 }
 
 /// Orchestrator: every 60 seconds, reload all transcripts, recompute aggregates for the active
@@ -188,7 +199,6 @@ struct ToastEvent: Sendable {
 /// per-minute number — independent of the chosen view mode.
 final class BurnTracker: @unchecked Sendable {
     var onUpdate: ((TrackerSnapshot) -> Void)?
-    var onSpike: ((TrackerSnapshot) -> Void)?
     var onRefreshStateChanged: ((RefreshState) -> Void)?
     /// Fires every `liveTickInterval` while the popover is shown. Replaces nothing — strictly
     /// additive over the 60s `onUpdate` snapshot.
@@ -196,6 +206,10 @@ final class BurnTracker: @unchecked Sendable {
     /// Fires once per breach when live USD/hr stays at/above threshold for the sustained window.
     /// Cooldown of `notificationCooldownSeconds` applies between fires.
     var onToast: ((ToastEvent) -> Void)?
+    /// Fires when a Claude model in the transcripts can't be priced even after a feed refetch —
+    /// the cost silently undercounts otherwise. Carries the unpriceable model name(s); fired once
+    /// per name. Delivered off the main thread — dispatch before touching UI.
+    var onUnpriceableModels: (([String]) -> Void)?
     /// Fires after every billing fetch — success or failure — so the popover indicator can
     /// reflect token state without re-polling the billing actor.
     var onBillingHealth: ((BillingHealth) -> Void)?
@@ -206,8 +220,6 @@ final class BurnTracker: @unchecked Sendable {
     static let pollInterval: TimeInterval = 60
     static let burnWindowSeconds: TimeInterval = 5 * 60
     static let billingTickInterval: TimeInterval = 30
-    static let spikeMultiplierDefault: Double = 2.0
-    static let spikeMinimumRateDefault: Double = 500
     static let liveTickInterval: TimeInterval = 4
     /// Min interval between `entries.plist` writes. Cap to avoid hammering the disk on hot
     /// sessions where every poll updates a couple files. 2 min is plenty — relaunch cost-savings
@@ -234,6 +246,9 @@ final class BurnTracker: @unchecked Sendable {
 
     private struct State {
         var pricingTable: [String: ModelPricing] = [:]
+        /// Versioned Anthropic pricing history (effective/expiration dated). Paired with
+        /// `pricingTable` so the aggregator can cost each entry at the rate effective when it ran.
+        var pricingVersions: [PricingVersion] = []
         var activeMode: ViewMode = .day
         var previousRate: Double = 0
         var lastSnapshot: TrackerSnapshot?
@@ -246,31 +261,30 @@ final class BurnTracker: @unchecked Sendable {
         /// Latest billing status string surfaced into the popover footer (rate-limited, auth
         /// failure, transport error, etc). Cleared on successful fetch.
         var billingStatusMessage: String?
-        // Tunable spike thresholds. Updated when the user saves settings.
-        var spikeMultiplier: Double = BurnTracker.spikeMultiplierDefault
-        var spikeMinimumRate: Double = BurnTracker.spikeMinimumRateDefault
         /// Tail-read offsets per file. Seeded at file size when live tracking starts so the live
         /// view shows only activity that occurs while the popover is open.
         var liveOffsets: [URL: UInt64] = [:]
         /// Rolling 60s window of new entries observed since live tracking started. Trimmed on
         /// every tick. Empty when popover is closed.
         var liveSamples: [UsageEntry] = []
-        /// Toast threshold tunables, mirrored from `Preferences` on apply.
-        var toastEnabled: Bool = false
-        var toastCostThreshold: Double = 8
-        var toastSustainedSeconds: Double = 30
+        /// Alert tunables, mirrored from `Preferences` on apply.
         var toastPeakAlertEnabled: Bool = true
         var toastPeakMinimumUSDPerHour: Double = 5
+        var projectionAlertEnabled: Bool = true
+        var projectionThresholdUSD: Double = 7000
+        var projectionMinTodayUSD: Double = 200
         var notificationCooldownSeconds: Double = 600
         /// Highest delta-derived $/hr we've already announced for the current local day. Reset on
         /// day rollover. Prevents repeated peak toasts when the same sample is read multiple times.
         var lastAnnouncedPeakUSDPerHour: Double = 0
         var lastPeakDay: String = ""
-        /// First moment the live rate exceeded `toastCostThreshold` in the current breach window.
-        /// Reset whenever the rate drops back below. Once `now - firstBreach >= sustained`, the
-        /// `onToast` callback fires and `lastToastFiredAt` advances to enforce cooldown.
-        var firstBreachAt: Date?
+        /// Local day key of the last fired projection alert. Gates the projection toast to at most
+        /// one fire per day regardless of how many billing fetches recompute the projection.
+        var lastProjectionAlertDay: String = ""
         var lastToastFiredAt: Date?
+        /// Claude models already warned about as unpriceable, so the error toast fires once per
+        /// model name rather than every poll. A model leaves "unknown" once a pricing refetch lands.
+        var warnedUnpriceableModels: Set<String> = []
         /// Timestamp of the last actual poll() execution. Watcher-triggered polls within 2s of
         /// the previous one short-circuit; timer + force triggers always proceed.
         var lastPollAt: Date?
@@ -285,17 +299,12 @@ final class BurnTracker: @unchecked Sendable {
 
     func applyPreferences(_ prefs: Preferences) {
         state.withLock {
-            $0.spikeMultiplier = prefs.spikeMultiplier
-            $0.spikeMinimumRate = prefs.spikeMinimumRate
-            $0.toastEnabled = prefs.toastEnabled
-            $0.toastCostThreshold = prefs.toastCostThresholdUSDPerHour
-            $0.toastSustainedSeconds = prefs.toastSustainedSeconds
             $0.toastPeakAlertEnabled = prefs.toastPeakAlertEnabled
             $0.toastPeakMinimumUSDPerHour = prefs.toastPeakMinimumUSDPerHour
+            $0.projectionAlertEnabled = prefs.monthlyProjectionAlertEnabled
+            $0.projectionThresholdUSD = prefs.monthlyProjectionThresholdUSD
+            $0.projectionMinTodayUSD = prefs.monthlyProjectionMinTodayUSD
             $0.notificationCooldownSeconds = prefs.notificationCooldownSeconds
-            // Threshold or enabled flag changed — reset the breach tracker so the next breach
-            // starts fresh rather than firing on stale state.
-            $0.firstBreachAt = nil
         }
         if let billingService {
             Task { await billingService.setPollInterval(minutes: prefs.oauthRefreshMinutes) }
@@ -367,7 +376,6 @@ final class BurnTracker: @unchecked Sendable {
             monthTokens: cached.monthTokens ?? 0,
             monthCostUSD: cached.monthCostUSD ?? 0,
             updatedAt: cached.savedAt,
-            spikeDetected: cached.recentSpike,
             // Stale only when the cached snapshot is older than two poll cycles. Fresh caches
             // already carry per-mode buckets + timelines, so we should render them immediately
             // instead of forcing the popover into a "loading…" state on every relaunch.
@@ -417,10 +425,13 @@ final class BurnTracker: @unchecked Sendable {
         Log.info(Log.tracker, "Tracker starting (poll=\(Self.pollInterval)s, window=\(Self.burnWindowSeconds)s)")
         Task { [pricingService, state, queue] in
             await pricingService.ensureLoaded()
-            let table = await pricingService.currentTable()
-            state.withLock { $0.pricingTable = table }
+            let dated = await pricingService.currentDatedTable()
+            state.withLock {
+                $0.pricingTable = dated.current
+                $0.pricingVersions = dated.versions
+            }
             await onPricingStatus?(pricingService.lastLoadedAt())
-            Log.info(Log.tracker, "Pricing table loaded: \(table.count) models")
+            Log.info(Log.tracker, "Pricing table loaded: \(dated.current.count) models")
             queue.async { [weak self] in self?.poll(trigger: .timer) }
             queue.async { [weak self] in self?.fetchBilling() }
         }
@@ -516,7 +527,6 @@ final class BurnTracker: @unchecked Sendable {
         state.withLock { state in
             state.liveOffsets = seeded
             state.liveSamples = []
-            state.firstBreachAt = nil
         }
 
         liveTimer?.cancel()
@@ -536,7 +546,6 @@ final class BurnTracker: @unchecked Sendable {
         state.withLock { state in
             state.liveOffsets = [:]
             state.liveSamples = []
-            state.firstBreachAt = nil
         }
     }
 
@@ -566,50 +575,16 @@ final class BurnTracker: @unchecked Sendable {
         let appended = newEntries
         let nextOffsetsFinal = nextOffsets
         let now = Date()
-        let (live, toastEvent) = state.withLock { state -> (LiveSnapshot, ToastEvent?) in
+        // Live tick only refreshes the popover top-sessions + menu-bar tooltip. Alerts are driven
+        // off the OAuth billing series (peak + projection), not the local JSONL rolling window.
+        let live = state.withLock { state -> LiveSnapshot in
             // Append, trim, then aggregate. Cheap because the live buffer caps at 60s of activity.
             state.liveSamples.append(contentsOf: appended)
             state.liveSamples.removeAll { $0.timestamp < cutoff }
             state.liveOffsets = nextOffsetsFinal
-            let snapshot = Self.computeLive(samples: state.liveSamples, table: table, now: now)
-
-            // Threshold tracker: only meaningful while toast alerts are enabled and we have at
-            // least one sample in the rolling window — empty windows produce a 0 rate that would
-            // otherwise reset breach state every tick.
-            guard state.toastEnabled, !state.liveSamples.isEmpty else {
-                state.firstBreachAt = nil
-                return (snapshot, nil)
-            }
-            if snapshot.costPerHour >= state.toastCostThreshold {
-                let firstBreach = state.firstBreachAt ?? now
-                state.firstBreachAt = firstBreach
-                let sustainedFor = now.timeIntervalSince(firstBreach)
-                let cooldownOK: Bool = if let last = state.lastToastFiredAt {
-                    now.timeIntervalSince(last) >= state.notificationCooldownSeconds
-                } else {
-                    true
-                }
-                if sustainedFor >= state.toastSustainedSeconds, cooldownOK {
-                    state.lastToastFiredAt = now
-                    let event = ToastEvent(
-                        kind: .threshold,
-                        costPerHour: snapshot.costPerHour,
-                        thresholdUSDPerHour: state.toastCostThreshold,
-                        topSession: snapshot.perSession.first,
-                        firstBreachAt: firstBreach,
-                        previousPeakUSDPerHour: nil,
-                        todayCostUSD: state.lastSnapshot?.displayTodayCostUSD ?? 0
-                    )
-                    return (snapshot, event)
-                }
-                return (snapshot, nil)
-            } else {
-                state.firstBreachAt = nil
-                return (snapshot, nil)
-            }
+            return Self.computeLive(samples: state.liveSamples, table: table, now: now)
         }
         onLiveUpdate?(live)
-        if let toastEvent { onToast?(toastEvent) }
     }
 
     private static func liveCost(for entry: UsageEntry, table: [String: ModelPricing]) -> Double {
@@ -682,8 +657,11 @@ final class BurnTracker: @unchecked Sendable {
             } else {
                 await pricingService.refreshIfStale()
             }
-            let table = await pricingService.currentTable()
-            state.withLock { $0.pricingTable = table }
+            let dated = await pricingService.currentDatedTable()
+            state.withLock {
+                $0.pricingTable = dated.current
+                $0.pricingVersions = dated.versions
+            }
             await onPricingStatus?(pricingService.lastLoadedAt())
         }
     }
@@ -737,6 +715,7 @@ final class BurnTracker: @unchecked Sendable {
             if let updated { onUpdate?(updated) }
             onBillingHealth?(health)
             checkDailyPeak()
+            checkMonthlyProjection(samples: billingSamples, monthToDateUSD: total, now: now)
         }
     }
 
@@ -839,6 +818,24 @@ final class BurnTracker: @unchecked Sendable {
         )
     }
 
+    /// Pure gate for the month-end projection alert. Fires only when enabled, the projection clears
+    /// the budget ceiling, today's spend has passed the noise floor, and no alert has fired yet
+    /// today. Extracted so the gating logic is unit-testable without the billing actor / locks.
+    static func shouldFireProjectionAlert(
+        projectedUSD: Double,
+        todayCostUSD: Double,
+        thresholdUSD: Double,
+        minTodayUSD: Double,
+        enabled: Bool,
+        lastAlertDay: String,
+        today: String
+    ) -> Bool {
+        guard enabled else { return false }
+        guard projectedUSD > thresholdUSD else { return false }
+        guard todayCostUSD > minTodayUSD else { return false }
+        return lastAlertDay != today
+    }
+
     /// Newest OAuth sample older than this → no fresh signal → spinner idles green. Generous
     /// enough to cover a couple of missed fetches at the default 5-min refresh.
     static let oauthStalenessSeconds: TimeInterval = 20 * 60
@@ -897,7 +894,7 @@ final class BurnTracker: @unchecked Sendable {
             .sorted { $0.timestamp < $1.timestamp }
         guard samples.count >= 2 else { return }
 
-        struct Pair { let rate: Double; let amount: Double; let at: Date }
+        struct Pair { let rate: Double; let amount: Double; let seconds: TimeInterval }
         var pairs: [Pair] = []
         pairs.reserveCapacity(samples.count - 1)
         // OAuth `extra_used_usd` updates on minute-ish cadence with billing-period resets.
@@ -912,7 +909,7 @@ final class BurnTracker: @unchecked Sendable {
             guard elapsed >= minIntervalSeconds else { continue }
             let amount = max(0, current.totalUSD - prior.totalUSD)
             let rate = amount / elapsed * 3600
-            pairs.append(Pair(rate: rate, amount: amount, at: current.timestamp))
+            pairs.append(Pair(rate: rate, amount: amount, seconds: elapsed))
         }
         guard let latest = pairs.last, latest.amount > 0 else { return }
         let priorMaxRate = pairs.dropLast().map(\.rate).max() ?? 0
@@ -923,7 +920,7 @@ final class BurnTracker: @unchecked Sendable {
             Self.computeLive(samples: state.liveSamples, table: state.pricingTable, now: Date())
         }
         let now = Date()
-        let event = state.withLock { state -> ToastEvent? in
+        let peak = state.withLock { state -> ToastEvent.DailyPeak? in
             // Day rolled over: clear the tracker so the first peak of the new day fires.
             if state.lastPeakDay != today {
                 state.lastPeakDay = today
@@ -944,25 +941,67 @@ final class BurnTracker: @unchecked Sendable {
             guard cooldownOK else { return nil }
             state.lastAnnouncedPeakUSDPerHour = latest.rate
             state.lastToastFiredAt = now
-            return ToastEvent(
-                kind: .dailyPeak,
-                costPerHour: latest.rate,
-                thresholdUSDPerHour: priorMaxRate,
+            return ToastEvent.DailyPeak(
+                sampleUSD: latest.amount,
+                sampleSeconds: latest.seconds,
+                peakUSDPerHour: latest.rate,
                 topSession: live?.perSession.first,
-                firstBreachAt: latest.at,
-                previousPeakUSDPerHour: priorMaxRate,
                 todayCostUSD: state.lastSnapshot?.displayTodayCostUSD ?? 0
+            )
+        }
+        if let peak {
+            Log.info(
+                Log.tracker,
+                String(
+                    format: "Daily peak alert: $%.2f over %.0fs ($%.2f/hr, prior peak $%.2f/hr)",
+                    peak.sampleUSD, peak.sampleSeconds, peak.peakUSDPerHour, priorMaxRate
+                )
+            )
+            onToast?(.dailyPeak(peak))
+        }
+    }
+
+    /// Fire the month-end projection alert once per day when the projected spend crosses the user's
+    /// budget ceiling. Gated on `monthlyProjectionMinTodayUSD` so it stays quiet on light days —
+    /// only a genuinely busy day (today's spend past the floor) can surface it, and only once.
+    private func checkMonthlyProjection(samples: [BillingSample], monthToDateUSD: Double?, now: Date) {
+        let calendar = Calendar.current
+        guard let projection = Self.monthlyProjection(
+            samples: samples,
+            monthToDateUSD: monthToDateUSD,
+            now: now,
+            calendar: calendar
+        ) else { return }
+        let today = Aggregator.dayKey(for: now, calendar: calendar)
+        let event = state.withLock { state -> ToastEvent.MonthlyProjectionAlert? in
+            let todaySpend = state.lastSnapshot?.displayTodayCostUSD ?? 0
+            guard Self.shouldFireProjectionAlert(
+                projectedUSD: projection.projectedUSD,
+                todayCostUSD: todaySpend,
+                thresholdUSD: state.projectionThresholdUSD,
+                minTodayUSD: state.projectionMinTodayUSD,
+                enabled: state.projectionAlertEnabled,
+                lastAlertDay: state.lastProjectionAlertDay,
+                today: today
+            ) else { return nil }
+            state.lastProjectionAlertDay = today
+            state.lastToastFiredAt = now
+            return ToastEvent.MonthlyProjectionAlert(
+                projectedUSD: projection.projectedUSD,
+                thresholdUSD: state.projectionThresholdUSD,
+                dailyBurnUSD: projection.dailyBurnUSD,
+                todayCostUSD: todaySpend
             )
         }
         if let event {
             Log.info(
                 Log.tracker,
                 String(
-                    format: "Daily peak alert: $%.2f/hr (prior peak $%.2f/hr)",
-                    event.costPerHour, event.previousPeakUSDPerHour ?? 0
+                    format: "Monthly projection alert: $%.0f projected > $%.0f threshold ($%.0f/day)",
+                    event.projectedUSD, event.thresholdUSD, event.dailyBurnUSD
                 )
             )
-            onToast?(event)
+            onToast?(.monthlyProjection(event))
         }
     }
 
@@ -1103,8 +1142,6 @@ final class BurnTracker: @unchecked Sendable {
             previous,
             fileCacheSnapshot,
             history,
-            spikeMultiplier,
-            spikeMinimumRate,
             priorFingerprint
         ) = state
             .withLock { state -> (
@@ -1113,8 +1150,6 @@ final class BurnTracker: @unchecked Sendable {
                 Double,
                 [URL: CachedFile],
                 [Double],
-                Double,
-                Double,
                 UInt64
             ) in
                 (
@@ -1123,8 +1158,6 @@ final class BurnTracker: @unchecked Sendable {
                     state.previousRate,
                     state.fileCache,
                     state.rateHistory,
-                    state.spikeMultiplier,
-                    state.spikeMinimumRate,
                     state.lastFileFingerprint
                 )
             }
@@ -1168,12 +1201,26 @@ final class BurnTracker: @unchecked Sendable {
         for entry in entries {
             if let model = entry.model { distinctModels.insert(model) }
         }
-        let unknownClaudeModel = distinctModels.contains {
+        let unknownClaudeModels = distinctModels.filter {
             $0.lowercased().hasPrefix("claude") && PricingResolver.resolve(model: $0, table: table) == nil
         }
-        refreshPricing(forceImmediate: unknownClaudeModel)
+        refreshPricing(forceImmediate: !unknownClaudeModels.isEmpty)
 
-        let aggregator = Aggregator(pricing: table)
+        // Surface unpriceable Claude models so they don't silently undercount. Fire once per name —
+        // a refetch (above) may price it on the next poll, in which case it never warned in vain;
+        // a genuinely unknown model warns once and stays recorded.
+        let newlyUnpriceable = state.withLock { state -> [String] in
+            let fresh = unknownClaudeModels.subtracting(state.warnedUnpriceableModels)
+            state.warnedUnpriceableModels.formUnion(fresh)
+            return fresh.sorted()
+        }
+        if !newlyUnpriceable.isEmpty { onUnpriceableModels?(newlyUnpriceable) }
+
+        let datedPricing = DatedPricingTable(
+            versions: state.withLock { $0.pricingVersions },
+            current: table
+        )
+        let aggregator = Aggregator(pricing: datedPricing)
 
         // Pre-aggregate every view mode so segmented-control switching is instant. Session-mode
         // buckets are scoped to today's entries so the popover opens on "what I worked on today"
@@ -1216,8 +1263,6 @@ final class BurnTracker: @unchecked Sendable {
         }()
         let median = Self.median(of: nextHistory)
 
-        let spike = previous > 0 && tokensPerMinute > previous * spikeMultiplier && tokensPerMinute > spikeMinimumRate
-
         let (billedSoFar, billingStatusSoFar) = state.withLock {
             ($0.billedMonthUSD, $0.billingStatusMessage)
         }
@@ -1240,7 +1285,6 @@ final class BurnTracker: @unchecked Sendable {
             monthTokens: monthBucket?.totalTokens ?? 0,
             monthCostUSD: monthBucket?.costUSD ?? 0,
             updatedAt: now,
-            spikeDetected: spike,
             stale: false,
             billedMonthUSD: billedSoFar,
             billingStatusMessage: billingStatusSoFar,
@@ -1296,7 +1340,7 @@ final class BurnTracker: @unchecked Sendable {
             buckets: activeBucketSnapshots,
             mode: mode.rawValue,
             burnRatePerMinute: tokensPerMinute,
-            recentSpike: spike,
+            recentSpike: false,
             bucketsByMode: encodedBuckets,
             timelinesByMode: encodedTimelines,
             medianTokensPerMinute: median,
@@ -1315,21 +1359,16 @@ final class BurnTracker: @unchecked Sendable {
         Log.info(
             Log.tracker,
             String(
-                format: "Snapshot buckets=%d tok/min=%.1f $/hr=%.2f total$=%.2f spike=%@",
+                format: "Snapshot buckets=%d tok/min=%.1f $/hr=%.2f total$=%.2f",
                 activeBuckets.count,
                 tokensPerMinute,
                 costPerHour,
-                totalCost,
-                spike ? "YES" : "no"
+                totalCost
             )
         )
 
         onUpdate?(snapshot)
         onRefreshStateChanged?(RefreshState(isRefreshing: false, message: ""))
-        if spike {
-            Log.info(Log.tracker, "Spike detected — notifying")
-            onSpike?(snapshot)
-        }
 
         // Billing fetch runs on its own timer (see `billingTimer` / `fetchBilling`) so the
         // OAuth call doesn't block on the JSONL aggregation cycle and surfaces refreshed

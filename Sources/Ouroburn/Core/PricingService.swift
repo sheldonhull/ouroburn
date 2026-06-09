@@ -4,7 +4,7 @@ import Foundation
 ///
 /// Schema: `{provider}.models.{id}.cost.{input|output|cache_read|cache_write}` in $/Mtok.
 /// We flatten across providers and convert to per-token rates.
-struct ModelPricing: Sendable, Equatable {
+struct ModelPricing: Sendable, Equatable, Codable {
     let inputCostPerToken: Double
     let outputCostPerToken: Double
     let cacheCreationCostPerToken: Double
@@ -30,10 +30,27 @@ actor PricingService {
     private var table: [String: ModelPricing] = [:]
     private var loadedAt: Date?
     private var lastForcedRefreshAt: Date?
+    private let history: PricingHistoryStore
+    private var versions: [PricingVersion] = []
 
     init(cacheURL: URL, session: URLSession = .shared) {
         self.cacheURL = cacheURL
         self.session = session
+        history = PricingHistoryStore(
+            url: cacheURL.deletingLastPathComponent().appendingPathComponent("pricing-history.json")
+        )
+        versions = history.load()
+    }
+
+    /// Date-aware pricing for the aggregator: Anthropic models cost at the rate effective when the
+    /// usage happened (versioned history), everything else at the current feed table.
+    func currentDatedTable() -> DatedPricingTable {
+        DatedPricingTable(versions: versions, current: table)
+    }
+
+    /// Fold a fresh feed observation into the versioned Anthropic history.
+    private func recordObservation(_ fresh: [String: ModelPricing], at observedAt: Date) {
+        versions = history.record(fullTable: fresh, observedAt: observedAt, into: versions)
     }
 
     /// Returns pricing for `modelName`, loading and caching the feed on first use.
@@ -91,6 +108,7 @@ actor PricingService {
             table = fresh
             loadedAt = Date()
             writeDiskCache(table: fresh, loadedAt: loadedAt!)
+            recordObservation(fresh, at: loadedAt!)
             Log.info(Log.pricing, "Pricing refreshed: \(fresh.count) models")
         } catch {
             Log.error(Log.pricing, "Pricing refresh failed: \(error.localizedDescription)")
@@ -112,6 +130,7 @@ actor PricingService {
             table = fresh
             loadedAt = Date()
             writeDiskCache(table: fresh, loadedAt: loadedAt!)
+            recordObservation(fresh, at: loadedAt!)
             Log.info(Log.pricing, "Fetched \(fresh.count) entries from models.dev feed")
             return
         } catch {
@@ -135,10 +154,20 @@ actor PricingService {
     }
 
     private func lookup(_ name: String) -> ModelPricing? {
+        let normalized = Self.normalizeModelName(name)
         for prefix in Self.prefixCandidates {
-            if let hit = table[prefix + name] { return hit }
+            if let hit = table[prefix + normalized] { return hit }
         }
-        return Self.fuzzyMatch(name, in: table)
+        return Self.fuzzyMatch(normalized, in: table)
+    }
+
+    /// Strips variant suffixes the models.dev feed doesn't key on — notably the context-window tier
+    /// tag, e.g. `claude-opus-4-8[1m]` → `claude-opus-4-8`. Applied before every lookup so a
+    /// 1M-context model prices as its base model instead of falling through to "unknown".
+    static func normalizeModelName(_ name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard let bracket = trimmed.firstIndex(of: "[") else { return trimmed }
+        return String(trimmed[..<bracket]).trimmingCharacters(in: .whitespaces)
     }
 
     /// Fuzzy fallback that never DOWNGRADES a newer model to an older one's rate. Accepts only

@@ -101,20 +101,20 @@ struct NumberFormattingTests {
     }
 
     @Test func compactDollarsKBoundary() {
-        #expect(NumberFormatting.compactDollars(1000) == "$1.00k")
+        #expect(NumberFormatting.compactDollars(1000) == "$1,000")
     }
 
     @Test func compactDollarsKTypical() {
-        #expect(NumberFormatting.compactDollars(1420) == "$1.42k")
+        #expect(NumberFormatting.compactDollars(1420) == "$1,420")
     }
 
     @Test func compactDollarsMBoundary() {
-        #expect(NumberFormatting.compactDollars(1_000_000) == "$1.00m")
+        #expect(NumberFormatting.compactDollars(1_000_000) == "$1,000,000")
     }
 
     @Test func compactDollarsNegative() {
-        // -$42.5 abs falls in <$1000 bucket → "$42" (rounds to even with %.0f) → "-$42".
-        #expect(NumberFormatting.compactDollars(-42.5) == "-$42")
+        // -$42.5 → abs rounds away-from-zero to 43 → "-$43".
+        #expect(NumberFormatting.compactDollars(-42.5) == "-$43")
     }
 
     @Test func compactDollarsNegativeUnderTen() {
@@ -144,7 +144,7 @@ struct NumberFormattingTests {
     }
 
     @Test func compactRateDollarsPerHour() {
-        #expect(NumberFormatting.compactRate(dollarsPerHour: 1420) == "$1.42k/hr")
+        #expect(NumberFormatting.compactRate(dollarsPerHour: 1420) == "$1,420/hr")
     }
 
     @Test func compactRateDollarsPerHourCents() {
@@ -153,5 +153,33 @@ struct NumberFormattingTests {
 
     @Test func compactRateDollarsPerHourNaN() {
         #expect(NumberFormatting.compactRate(dollarsPerHour: Double.nan) == "—")
+    }
+
+    // MARK: humanizedDuration
+
+    @Test func humanizedDurationSeconds() {
+        #expect(NumberFormatting.humanizedDuration(seconds: 45) == "45s")
+    }
+
+    @Test func humanizedDurationMinuteBoundary() {
+        #expect(NumberFormatting.humanizedDuration(seconds: 60) == "1 min")
+    }
+
+    @Test func humanizedDurationMinutes() {
+        #expect(NumberFormatting.humanizedDuration(seconds: 6 * 60) == "6 min")
+    }
+
+    @Test func humanizedDurationHourExact() {
+        #expect(NumberFormatting.humanizedDuration(seconds: 3600) == "1h")
+    }
+
+    @Test func humanizedDurationHourAndMinutes() {
+        #expect(NumberFormatting.humanizedDuration(seconds: 3600 + 5 * 60) == "1h 5m")
+    }
+
+    @Test func humanizedDurationZeroAndNegativeAndNaN() {
+        #expect(NumberFormatting.humanizedDuration(seconds: 0) == "0s")
+        #expect(NumberFormatting.humanizedDuration(seconds: -10) == "0s")
+        #expect(NumberFormatting.humanizedDuration(seconds: Double.nan) == "0s")
     }
 }

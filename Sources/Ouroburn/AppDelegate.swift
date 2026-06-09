@@ -11,7 +11,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusBar: StatusBarController?
     private var tracker: BurnTracker?
-    private var notifier: Notifier?
     private var settingsWindow: SettingsWindowController?
     private var spendHistoryWindow: BillingHistoryWindowController?
 
@@ -29,28 +28,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tracker.applyPreferences(prefs)
         tracker.setMode(prefs.defaultMode)
         let statusBar = StatusBarController(tracker: tracker)
-        let notifier: Notifier? = Bundle.main.bundleIdentifier != nil
-            ? Notifier(cooldown: prefs.notificationCooldownSeconds)
-            : nil
 
         self.tracker = tracker
         self.statusBar = statusBar
-        self.notifier = notifier
 
         // Wire callbacks BEFORE calling render. A heavy bootstrap render can deadlock or stall
         // the main run loop (the popover view tree gets force-loaded with 700+ rows), and we
         // never want a slow render to leave the menu's Settings hook unwired.
         tracker.onUpdate = { [weak statusBar] snapshot in
             DispatchQueue.main.async { statusBar?.render(snapshot: snapshot) }
-        }
-        tracker.onSpike = { [weak notifier] snapshot in
-            DispatchQueue.main.async {
-                notifier?.deliverSpike(
-                    currentRate: snapshot.tokensPerMinute,
-                    previousRate: snapshot.previousTokensPerMinute,
-                    todayCostUSD: snapshot.displayTodayCostUSD
-                )
-            }
         }
         tracker.onRefreshStateChanged = { [weak statusBar] state in
             DispatchQueue.main.async { statusBar?.setRefreshState(state) }
@@ -64,29 +50,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tracker.onToast = { event in
             DispatchQueue.main.async {
                 let (title, message, accent): (String, String, NSColor)
-                let today = NumberFormatting.compactDollars(event.todayCostUSD)
-                switch event.kind {
-                case .threshold:
-                    title = "Burn rate alert"
-                    accent = Theme.accentPeach
-                    if let session = event.topSession, session.tokensPerMinute > 0 {
-                        let label = Self.shortenSessionLabel(project: session.projectPath)
-                        let rate = NumberFormatting.compactRate(tokensPerMinute: session.tokensPerMinute)
-                        message = "\(today) today · top: \(label) (\(rate))"
-                    } else {
-                        message = "\(today) today · sustained burn"
-                    }
-                case .dailyPeak:
-                    title = "New daily peak"
+                switch event {
+                case let .dailyPeak(peak):
+                    title = "Today's peak spend rate"
                     accent = Theme.accentRed
-                    if let session = event.topSession, session.tokensPerMinute > 0 {
+                    let sample = NumberFormatting.compactDollars(peak.sampleUSD)
+                    let period = NumberFormatting.humanizedDuration(seconds: peak.sampleSeconds)
+                    let today = NumberFormatting.compactDollars(peak.todayCostUSD)
+                    if let session = peak.topSession, session.tokensPerMinute > 0 {
                         let label = Self.shortenSessionLabel(project: session.projectPath)
-                        message = "\(today) today · top: \(label)"
+                        message = "\(sample) in last \(period) · \(today) today · top: \(label)"
                     } else {
-                        message = "\(today) today"
+                        message = "\(sample) in last \(period) · \(today) today"
                     }
+                case let .monthlyProjection(alert):
+                    title = "Projected month over budget"
+                    accent = Theme.accentPeach
+                    let projected = NumberFormatting.compactDollars(alert.projectedUSD)
+                    let threshold = NumberFormatting.compactDollars(alert.thresholdUSD)
+                    let perDay = NumberFormatting.compactDollars(alert.dailyBurnUSD)
+                    message = "\(projected) projected > \(threshold) · \(perDay)/day"
                 }
                 ToastWindow.show(title: title, message: message, accent: accent)
+            }
+        }
+        tracker.onUnpriceableModels = { models in
+            DispatchQueue.main.async {
+                let list = models.joined(separator: ", ")
+                ToastWindow.show(
+                    title: "Unpriced model",
+                    message: "No rate for \(list) — cost undercounts. Refreshing pricing…",
+                    accent: Theme.accentRed
+                )
             }
         }
         statusBar.onShowSettings = { [self] in
@@ -113,7 +108,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.info(Log.app, "No snapshot cache found at \(snapshotURL.path)")
         }
 
-        notifier?.requestAuthorization()
         tracker.start()
         Log.info(Log.app, "LaunchAtLogin status at startup: enabled=\(LaunchAtLogin.isEnabled())")
         Log.info(Log.app, "applicationDidFinishLaunching complete")
@@ -174,6 +168,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onPreferencesSaved: { [weak self] prefs in
                     Log.info(Log.app, "Preferences saved")
                     self?.tracker?.applyPreferences(prefs)
+                },
+                onRefreshPricing: { [weak self] completion in
+                    Log.info(Log.app, "Manual pricing refresh requested from settings")
+                    self?.tracker?.refreshPricingManually(completion: completion)
                 }
             )
         }

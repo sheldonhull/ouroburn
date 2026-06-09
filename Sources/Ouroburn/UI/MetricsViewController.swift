@@ -17,6 +17,11 @@ final class MetricsViewController: NSViewController {
     private let projTile = StatTile(title: "Proj", symbol: "chart.line.uptrend.xyaxis")
 
     private let segmented = NSSegmentedControl()
+    /// Clarifies that the breakdown rows below are the local list-price estimate — not the OAuth
+    /// billed figure on the Month tile. The two differ by the "Other / unexplained" gap.
+    private let breakdownCaption = NSTextField(
+        labelWithString: "local list-price estimate · billed total on the Month tile above"
+    )
     private let heartbeatView = OAuthHeartbeatView()
     private let heartbeatStore = BillingSampleStore()
     private let topSessionsView = TopSessionsView()
@@ -233,6 +238,11 @@ final class MetricsViewController: NSViewController {
         heartbeatView.setRange(.month)
         renderHeartbeat()
         renderTopSessions(snapshot: snapshot)
+        renderGraph(snapshot: snapshot)
+        // Re-render the breakdown list from the same snapshot the tiles use, so the monthly row
+        // can't lag behind the Month/Other tiles (which caused the tile-vs-row mismatch on open).
+        renderListIfChanged(snapshot: snapshot)
+        renderFooter(snapshot: snapshot)
         setPricingAge(lastPricingLoadedAt) // re-render the relative age as it grows
     }
 
@@ -312,21 +322,7 @@ final class MetricsViewController: NSViewController {
             )
         }
 
-        // "Other" reconciliation tile — the signed gap between OAuth-billed month spend and the
-        // local JSONL estimate. Surfaces charges the local transcripts can't explain. Shows a
-        // placeholder until an OAuth month figure exists.
-        if let other = snapshot.otherMonthUSD {
-            let accent: NSColor = abs(other) < 0.005
-                ? Theme.accentMint
-                : (other > 0 ? Theme.accentPeach : Theme.accentBlue)
-            otherTile.updateDelta(
-                valueUSD: other,
-                caption: "unexplained",
-                accent: accent
-            )
-        } else {
-            otherTile.updateDelta(valueUSD: nil, caption: "needs OAuth", accent: Theme.accentBlue)
-        }
+        renderOtherTile(snapshot: snapshot)
 
         // Projected month-end spend from the median active-day OAuth burn. Caption shows the
         // per-day burn driving it; grows more accurate as the month accumulates days.
@@ -357,6 +353,19 @@ final class MetricsViewController: NSViewController {
             setConnectionState(.connected(spendUSD: snapshot.billedMonthUSD))
         } else {
             setConnectionState(.disconnected)
+        }
+    }
+
+    /// "Other" tile — estimated remote spend: how much more OAuth billed this month than the local
+    /// JSONL estimate accounts for (usage outside Claude Code, or pricing the local estimate
+    /// underrates). Month-only and never negative (see `otherMonthUSD`). Placeholder until an OAuth
+    /// month figure exists.
+    private func renderOtherTile(snapshot: TrackerSnapshot) {
+        if let value = snapshot.otherMonthUSD {
+            let accent: NSColor = value < 0.005 ? Theme.accentMint : Theme.accentPeach
+            otherTile.updateDelta(valueUSD: value, caption: "est. remote", accent: accent)
+        } else {
+            otherTile.updateDelta(valueUSD: nil, caption: "needs OAuth", accent: Theme.accentBlue)
         }
     }
 
@@ -443,9 +452,9 @@ final class MetricsViewController: NSViewController {
         }
         monthTile.onClick = { [weak self] in self?.onMonthlyTileClick?() }
         monthTile.toolTip = "Click for sample-by-sample Anthropic spend history"
-        otherTile.toolTip = "OAuth-billed month minus local JSONL estimate. Positive = billed spend "
-            + "the local transcripts don't account for (e.g. usage outside Claude Code); negative = "
-            + "local list-price estimate the subscription quota absorbed."
+        otherTile.toolTip = "Estimated remote spend: OAuth-billed month minus the local JSONL "
+            + "estimate — spend the local transcripts don't account for (usage outside Claude Code, "
+            + "or pricing the local estimate underrates). $0 when local already covers billed."
         projTile.toolTip = "Projected month-end spend: month-to-date + median active-day OAuth burn "
             + "× remaining weekdays (+1 for today). Weekends count only if they billed."
 
@@ -495,12 +504,22 @@ final class MetricsViewController: NSViewController {
         segmented.selectedSegment = 0
         view.addSubview(segmented)
 
+        breakdownCaption.font = Theme.bodyFont(size: 9)
+        breakdownCaption.textColor = Theme.textTertiary
+        breakdownCaption.alignment = .center
+        breakdownCaption.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(breakdownCaption)
+
         // Pinned below the top-5 sessions panel — all of these drill-down controls operate on the
         // same local-transcript data introduced by the "Local sessions" divider above.
         NSLayoutConstraint.activate([
             segmented.topAnchor.constraint(equalTo: topSessionsView.bottomAnchor, constant: 10),
             segmented.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
-            segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18)
+            segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
+
+            breakdownCaption.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 4),
+            breakdownCaption.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            breakdownCaption.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14)
         ])
     }
 
@@ -541,7 +560,7 @@ final class MetricsViewController: NSViewController {
         view.addSubview(graphView)
         view.addSubview(graphSpinner)
         NSLayoutConstraint.activate([
-            graphView.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 8),
+            graphView.topAnchor.constraint(equalTo: breakdownCaption.bottomAnchor, constant: 6),
             graphView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
             graphView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
             graphView.heightAnchor.constraint(equalToConstant: 90),
@@ -1088,13 +1107,12 @@ final class StatTile: NSView {
         onHover?(false)
     }
 
-    /// Variant for the "Other" reconciliation tile: a signed dollar delta with a free-text caption
+    /// Variant for the "Other" tile: a plain (non-negative) dollar value with a free-text caption
     /// in place of the token line. `valueUSD == nil` renders a dim placeholder dash.
     func updateDelta(valueUSD: Double?, caption: String, accent: NSColor) {
         if let valueUSD {
-            let sign = valueUSD >= 0 ? "+" : "−"
             cost.attributedStringValue = Theme.glowAttributedTitle(
-                "\(sign)\(NumberFormatting.compactDollars(abs(valueUSD)))",
+                NumberFormatting.compactDollars(valueUSD),
                 color: accent,
                 font: Theme.titleFont(size: 18)
             )

@@ -68,7 +68,7 @@ final class ToastWindow {
     }
 
     private init(title: String, message: String, accent: NSColor) {
-        let width: CGFloat = 640
+        let width: CGFloat = 360
         let height: CGFloat = 88
         panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -134,7 +134,7 @@ private final class ToastContentView: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 12
-        layer?.backgroundColor = Theme.surface.withAlphaComponent(0.96).cgColor
+        layer?.backgroundColor = Theme.background.withAlphaComponent(0.96).cgColor
         layer?.borderColor = Theme.divider.cgColor
         layer?.borderWidth = 1
         Theme.applyGhostRim(layer!, color: accent, rimAlpha: 0.55, glowRadius: 14, glowAlpha: 0.42)

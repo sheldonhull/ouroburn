@@ -161,6 +161,11 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
             symbol: "arrow.clockwise",
             action: #selector(refreshNow(_:))
         ))
+        menu.addItem(makeMenuItem(
+            title: "Refresh model pricing",
+            symbol: "tag.circle",
+            action: #selector(refreshPricing(_:))
+        ))
         menu.addItem(.separator())
         menu.addItem(makeMenuItem(title: "Settings…", symbol: "gearshape", action: #selector(openSettings(_:))))
         menu.addItem(makeMenuItem(
@@ -176,6 +181,13 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
     @objc private func refreshNow(_: Any?) {
         Log.info(Log.ui, "Refresh now menu item triggered")
         tracker.forceRefresh()
+    }
+
+    @objc private func refreshPricing(_: Any?) {
+        Log.info(Log.ui, "Refresh model pricing menu item triggered")
+        tracker.refreshPricingManually { [weak metrics] date in
+            DispatchQueue.main.async { metrics?.setPricingAge(date) }
+        }
     }
 
     @objc private func quitApp(_: Any?) {

@@ -27,15 +27,41 @@ enum NumberFormatting {
         }
     }
 
+    /// Full dollar amount with comma thousands separators (e.g. `$2,091`). Cents kept only under
+    /// $10 where they matter; everything else rounds to whole dollars. No `k`/`m` suffix — the
+    /// abbreviated form read ambiguously (`$2.09k` vs `2090`?), so the full number is shown.
     static func compactDollars(_ amount: Double) -> String {
         if !amount.isFinite { return "—" }
         if amount < 0 { return "-" + compactDollars(-amount) }
-        switch amount {
-        case ..<10: return String(format: "$%.2f", amount)
-        case ..<1000: return String(format: "$%.0f", amount)
-        case ..<1_000_000: return String(format: "$%.2fk", amount / 1000)
-        default: return String(format: "$%.2fm", amount / 1_000_000)
+        if amount < 10 { return String(format: "$%.2f", amount) }
+        return "$" + grouped(Int(amount.rounded()))
+    }
+
+    /// Non-negative integer with comma thousands separators. Locale-independent (manual grouping)
+    /// to match the rest of this file's C-locale formatting.
+    static func grouped(_ value: Int) -> String {
+        let digits = String(value)
+        guard digits.count > 3 else { return digits }
+        var out = ""
+        for (offset, ch) in digits.reversed().enumerated() {
+            if offset > 0, offset.isMultiple(of: 3) { out.append(",") }
+            out.append(ch)
         }
+        return String(out.reversed())
+    }
+
+    /// Coarse human-readable duration for alert copy: `45s`, `6 min`, `1h 5m`. Rounds to the
+    /// nearest second; sub-second and non-finite inputs render as `0s`. Used to describe the
+    /// sample period a peak-spend reading covers, not for precise timing.
+    static func humanizedDuration(seconds: TimeInterval) -> String {
+        guard seconds.isFinite, seconds > 0 else { return "0s" }
+        let total = Int(seconds.rounded())
+        if total < 60 { return "\(total)s" }
+        let minutes = total / 60
+        if total < 3600 { return "\(minutes) min" }
+        let hours = total / 3600
+        let remMinutes = (total % 3600) / 60
+        return remMinutes == 0 ? "\(hours)h" : "\(hours)h \(remMinutes)m"
     }
 
     static func compactRate(tokensPerMinute value: Double) -> String {
