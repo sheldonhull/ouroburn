@@ -14,14 +14,13 @@ final class MetricsViewController: NSViewController {
     private let weekTile = StatTile(title: "Week", symbol: "calendar")
     private let otherTile = StatTile(title: "Other", symbol: "plusminus.circle")
     private let monthTile = StatTile(title: "Month", symbol: "creditcard")
-    private let projTile = StatTile(title: "Proj", symbol: "chart.line.uptrend.xyaxis")
+    /// "Daily" tile: big value is the normal daily spend (median across active days); caption folds
+    /// in the month-end projection so both live in one tile.
+    private let projTile = StatTile(title: "Daily", symbol: "calendar.day.timeline.left")
 
     private let segmented = NSSegmentedControl()
-    /// Clarifies that the breakdown rows below are the local list-price estimate — not the OAuth
-    /// billed figure on the Month tile. The two differ by the "Other / unexplained" gap.
-    private let breakdownCaption = NSTextField(
-        labelWithString: "local list-price estimate · billed total on the Month tile above"
-    )
+    /// Single minimal line under the hero tiles: month total tokens, nothing else.
+    private let tokensLabel = NSTextField(labelWithString: "")
     private let heartbeatView = OAuthHeartbeatView()
     private let heartbeatStore = BillingSampleStore()
     private let topSessionsView = TopSessionsView()
@@ -56,7 +55,7 @@ final class MetricsViewController: NSViewController {
     /// project paths previously stretched the row labels) no longer reflows the popover frame.
     /// Narrower than the original 580pt to read as a tighter overlay; taller so the bottom
     /// drill-down list gets more vertical room before it has to scroll.
-    private static let contentSize = NSSize(width: 580, height: 912)
+    private static let contentSize = NSSize(width: 552, height: 918)
 
     override func loadView() {
         let root = NSView(frame: NSRect(origin: .zero, size: Self.contentSize))
@@ -232,6 +231,11 @@ final class MetricsViewController: NSViewController {
     /// waiting for the next 60s tick.
     func popoverWillShow() {
         guard let snapshot else { return }
+        // Open on the Models tab every time — the default landing view.
+        displayedMode = .models
+        if let index = ViewMode.allCases.firstIndex(of: .models) {
+            segmented.selectedSegment = index
+        }
         renderHero(snapshot: snapshot)
         // Reset the OAuth graph to the month default on every open so it's stable and hoverable;
         // tile hover can still switch ranges from there.
@@ -265,13 +269,9 @@ final class MetricsViewController: NSViewController {
 
         // Summarize the local-transcript data feeding this section: session count + the local
         // (JSONL) token/cost totals. Distinct from the OAuth-billed figures in the tiles above.
-        let active = buckets.filter(\.isActive).count
-        let tokens = buckets.reduce(0) { $0 + $1.totalTokens }
-        let cost = buckets.reduce(0.0) { $0 + $1.costUSD }
-        let activeSuffix = active > 0 ? " · \(active) active" : ""
-        sectionDivider.update(
-            stat: "\(buckets.count) sessions\(activeSuffix) · \(NumberFormatting.compactTokens(tokens)) tk · \(NumberFormatting.compactDollars(cost))"
-        )
+        // Header carries only the LOCAL realtime signal — the ~30m rolling local burn rate ($/hr),
+        // distinct from the OAuth-billed graph above. Session/token roll-ups live in the drill-down.
+        sectionDivider.update(stat: NumberFormatting.compactRate(dollarsPerHour: snapshot.medianCostPerHour))
     }
 
     @objc private func segmentChanged(_ sender: NSSegmentedControl) {
@@ -303,43 +303,52 @@ final class MetricsViewController: NSViewController {
             accent: Theme.accentMint,
             placeholder: snapshot.stale && snapshot.weekTokens == 0
         )
-        // Monthly tile prefers the upstream Anthropic OAuth spend when available — that's the
-        // billed truth. Falls back to local-aggregate sum so the tile still has a number when
-        // the user hasn't signed in yet.
-        if let billed = snapshot.billedMonthUSD {
-            monthTile.update(
-                tokens: snapshot.monthTokens,
-                costUSD: billed,
-                accent: Theme.accentPeach,
-                placeholder: false
+        let proj = BurnTracker.monthlyProjection(
+            samples: heartbeatStore.load(),
+            monthToDateUSD: snapshot.billedMonthUSD,
+            now: Date(),
+            calendar: .current
+        )
+
+        // Month tile: actual month spend (OAuth billed truth, else local estimate). Subtext = the
+        // computed per-active-business-day average, no other commentary.
+        let monthSpend = snapshot.billedMonthUSD ?? snapshot.monthCostUSD
+        if let proj, proj.activeDays > 0 {
+            let perDay = monthSpend / Double(proj.activeDays)
+            monthTile.updateCaptioned(
+                costUSD: monthSpend,
+                caption: "\(NumberFormatting.compactDollars(perDay))/day",
+                accent: Theme.accentPeach
             )
         } else {
-            monthTile.update(
-                tokens: snapshot.monthTokens,
-                costUSD: snapshot.monthCostUSD,
-                accent: Theme.accentPeach,
-                placeholder: snapshot.stale && snapshot.monthTokens == 0
+            monthTile.updateCaptioned(
+                costUSD: snapshot.billedMonthUSD == nil && snapshot.stale && snapshot
+                    .monthTokens == 0 ? nil : monthSpend,
+                caption: "month",
+                accent: Theme.accentPeach
             )
         }
 
         renderOtherTile(snapshot: snapshot)
 
-        // Projected month-end spend from the median active-day OAuth burn. Caption shows the
-        // per-day burn driving it; grows more accurate as the month accumulates days.
-        if let proj = BurnTracker.monthlyProjection(
-            samples: heartbeatStore.load(),
-            monthToDateUSD: snapshot.billedMonthUSD,
-            now: Date(),
-            calendar: .current
-        ) {
+        // Minimal token line under the tiles — month total, no commentary.
+        tokensLabel.stringValue = "\(NumberFormatting.compactTokens(snapshot.monthTokens)) tk"
+
+        // Daily tile: normal daily spend = median across active days. Subtext = the projected
+        // month total, no label beyond "mo"; the hover tooltip carries the projection formula.
+        if let proj {
             projTile.updateCaptioned(
-                costUSD: proj.projectedUSD,
-                caption: "\(NumberFormatting.compactDollars(proj.dailyBurnUSD))/day",
+                costUSD: proj.dailyBurnUSD,
+                caption: "\(NumberFormatting.compactDollars(proj.projectedUSD)) mo",
                 accent: Theme.accentLime
             )
         } else {
             projTile.updateCaptioned(costUSD: nil, caption: "needs OAuth", accent: Theme.accentBlue)
         }
+
+        // Orb accents track their tier so each pulse reads hot/cool at a glance: the Local sessions
+        // orb from the ~30m local burn, the OAuth graph orb from the OAuth burn rate.
+        sectionDivider.setOrbAccent(costTierColor(snapshot.medianCostPerHour))
 
         // Connection state derivation order:
         // 1. Mid-PKCE-flow always wins — never overwrite the spinner.
@@ -413,8 +422,9 @@ final class MetricsViewController: NSViewController {
 
     private func renderGraph(snapshot: TrackerSnapshot) {
         let timeline = snapshot.timelinesByMode[displayedMode] ?? []
-        let metric: LineGraphMetric = displayedMode == .session ? .cost : .tokens
-        let accent = displayedMode == .session
+        let costMetricMode = displayedMode == .session || displayedMode == .models
+        let metric: LineGraphMetric = costMetricMode ? .cost : .tokens
+        let accent = costMetricMode
             ? Theme.accentMint
             : rateColor(rate: snapshot.medianTokensPerMinute)
         graphView.update(points: timeline, accent: accent, metric: metric)
@@ -430,20 +440,65 @@ final class MetricsViewController: NSViewController {
         footerLabel.stringValue = "Updated \(formatter.string(from: snapshot.updatedAt))   ·   60s poll · click row to expand"
     }
 
+    /// Models tab data — derived from the current month's per-model breakdown (the same source the
+    /// bucket rows already carry), so it's populated straight from the cache on open. One synthetic
+    /// bucket per model, sorted by cost.
+    private func modelsBuckets(from snapshot: TrackerSnapshot) -> [AggregateBucket] {
+        let monthBuckets = snapshot.bucketsByMode[.month] ?? []
+        let monthKey = Aggregator.monthKey(for: Date(), calendar: .current)
+        let current = monthBuckets.first { $0.id == monthKey } ?? monthBuckets.first
+        guard let models = current?.models, !models.isEmpty else { return [] }
+        return models
+            .sorted { $0.costUSD > $1.costUSD }
+            .map { model in
+                AggregateBucket(
+                    id: model.model,
+                    key: model.model,
+                    start: nil,
+                    end: nil,
+                    inputTokens: model.inputTokens,
+                    outputTokens: model.outputTokens,
+                    cacheCreationTokens: model.cacheCreationTokens,
+                    cacheReadTokens: model.cacheReadTokens,
+                    costUSD: model.costUSD,
+                    models: [model],
+                    isActive: false,
+                    isGap: false,
+                    cwd: nil
+                )
+            }
+    }
+
     private func renderListIfChanged(snapshot: TrackerSnapshot, force: Bool = false) {
-        let buckets = snapshot.bucketsByMode[displayedMode] ?? []
+        let buckets = displayedMode == .models
+            ? modelsBuckets(from: snapshot)
+            : (snapshot.bucketsByMode[displayedMode] ?? [])
         let ids = buckets.prefix(rowRenderCap).map(\.id)
         let same = ids == lastRenderedRowIDs && lastRenderedMode == displayedMode
         // Spinner suppressed: pulse orb handles the "still working" signal, and the empty-state
         // card surfaces the "no data yet" message when buckets are genuinely empty.
         listSpinner.setLoading(false)
-        if same, !force {
-            updateRowsInPlace(buckets: buckets)
-            return
-        }
         lastRenderedMode = displayedMode
         lastRenderedRowIDs = ids
+        // Preserve scroll whenever the row set + mode are unchanged — that's the refresh-in-place
+        // case (a 30s/60s tick lands while you read) and the expand-toggle case. Only a genuine
+        // mode switch resets to top. Stops the panel from "collapsing what you're looking at."
+        rebuildRows(buckets, preserveScroll: same)
+    }
+
+    /// Rebuild the drill-down rows, optionally holding the scroll position steady across the swap.
+    /// `BucketRowView` is single-shot today so we recreate rather than mutate; capturing and
+    /// restoring the clip-view origin keeps the visible content pinned.
+    private func rebuildRows(_ buckets: [AggregateBucket], preserveScroll: Bool) {
+        let offset = scrollView.contentView.bounds.origin
         renderRows(buckets)
+        guard preserveScroll else { return }
+        view.layoutSubtreeIfNeeded()
+        let docHeight = scrollView.documentView?.frame.height ?? 0
+        let visibleHeight = scrollView.contentView.bounds.height
+        let clampedY = min(max(offset.y, 0), max(0, docHeight - visibleHeight))
+        scrollView.contentView.scroll(to: NSPoint(x: offset.x, y: clampedY))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     private func configureHero() {
@@ -451,12 +506,13 @@ final class MetricsViewController: NSViewController {
             tile.translatesAutoresizingMaskIntoConstraints = false
         }
         monthTile.onClick = { [weak self] in self?.onMonthlyTileClick?() }
-        monthTile.toolTip = "Click for sample-by-sample Anthropic spend history"
         otherTile.toolTip = "Estimated remote spend: OAuth-billed month minus the local JSONL "
             + "estimate — spend the local transcripts don't account for (usage outside Claude Code, "
             + "or pricing the local estimate underrates). $0 when local already covers billed."
-        projTile.toolTip = "Projected month-end spend: month-to-date + median active-day OAuth burn "
-            + "× remaining weekdays (+1 for today). Weekends count only if they billed."
+        monthTile.toolTip = "Month spend (OAuth billed, else local estimate). Subtext: spend ÷ "
+            + "active business days = computed daily average. Click for spend history."
+        projTile.toolTip = "Normal daily spend: median OAuth burn across active days. Subtext is "
+            + "the projected month total = month-to-date + median × remaining weekdays (+1 today)."
 
         // Hover a tile to scope the OAuth graph to that range. Only the enter switches — there's
         // no revert on exit, so moving the cursor off a tile and down onto the graph keeps the
@@ -478,12 +534,32 @@ final class MetricsViewController: NSViewController {
 
         view.addSubview(tileRow)
 
+        tokensLabel.font = Theme.numericFont(size: 11)
+        tokensLabel.textColor = Theme.textTertiary
+        tokensLabel.alignment = .center
+        tokensLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(tokensLabel)
+
         NSLayoutConstraint.activate([
-            tileRow.topAnchor.constraint(equalTo: view.topAnchor, constant: 16),
+            tileRow.topAnchor.constraint(equalTo: view.topAnchor, constant: 14),
             tileRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
             tileRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
-            tileRow.heightAnchor.constraint(equalToConstant: 86)
+            tileRow.heightAnchor.constraint(equalToConstant: 86),
+
+            tokensLabel.topAnchor.constraint(equalTo: tileRow.bottomAnchor, constant: 6),
+            tokensLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
+            tokensLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14)
         ])
+    }
+
+    /// Soft blip on the OAuth billing graph — a real upstream fetch landed while the popover is open.
+    func pulseOAuthOrb() {
+        heartbeatView.pulseRefresh()
+    }
+
+    /// Stronger neon radial on the Local sessions header — a local live refresh tick fired.
+    func pulseLocalOrb() {
+        sectionDivider.pulse()
     }
 
     private func configureSegmented() {
@@ -504,22 +580,12 @@ final class MetricsViewController: NSViewController {
         segmented.selectedSegment = 0
         view.addSubview(segmented)
 
-        breakdownCaption.font = Theme.bodyFont(size: 9)
-        breakdownCaption.textColor = Theme.textTertiary
-        breakdownCaption.alignment = .center
-        breakdownCaption.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(breakdownCaption)
-
         // Pinned below the top-5 sessions panel — all of these drill-down controls operate on the
         // same local-transcript data introduced by the "Local sessions" divider above.
         NSLayoutConstraint.activate([
             segmented.topAnchor.constraint(equalTo: topSessionsView.bottomAnchor, constant: 10),
             segmented.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
-            segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
-
-            breakdownCaption.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 4),
-            breakdownCaption.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
-            breakdownCaption.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14)
+            segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18)
         ])
     }
 
@@ -537,7 +603,7 @@ final class MetricsViewController: NSViewController {
         view.addSubview(topSessionsView)
 
         NSLayoutConstraint.activate([
-            heartbeatView.topAnchor.constraint(equalTo: monthTile.bottomAnchor, constant: 14),
+            heartbeatView.topAnchor.constraint(equalTo: tokensLabel.bottomAnchor, constant: 10),
             heartbeatView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
             heartbeatView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
             heartbeatView.heightAnchor.constraint(equalToConstant: 170),
@@ -560,7 +626,7 @@ final class MetricsViewController: NSViewController {
         view.addSubview(graphView)
         view.addSubview(graphSpinner)
         NSLayoutConstraint.activate([
-            graphView.topAnchor.constraint(equalTo: breakdownCaption.bottomAnchor, constant: 6),
+            graphView.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 8),
             graphView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 14),
             graphView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -14),
             graphView.heightAnchor.constraint(equalToConstant: 90),
@@ -709,6 +775,10 @@ final class MetricsViewController: NSViewController {
             stack.removeArrangedSubview(view); view.removeFromSuperview()
         }
         if buckets.isEmpty { renderEmptyState(); return }
+        if displayedMode == .models {
+            renderModelRows(buckets)
+            return
+        }
         if displayedMode == .session {
             renderSessionTree(buckets)
             return
@@ -905,6 +975,111 @@ final class MetricsViewController: NSViewController {
         overflow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -8).isActive = true
     }
 
+    /// Models tab: per-model spend leaderboard for the current month + a grand-total header.
+    private func renderModelRows(_ buckets: [AggregateBucket]) {
+        let totalCost = buckets.reduce(0.0) { $0 + $1.costUSD }
+        let totalTokens = buckets.reduce(0) { $0 + $1.totalTokens }
+        appendModelHeader(count: buckets.count, totalTokens: totalTokens, totalCost: totalCost)
+        let maxCost = Swift.max(buckets.map(\.costUSD).max() ?? 0, 0.0001)
+        for (index, bucket) in buckets.prefix(rowRenderCap).enumerated() {
+            let row = makeModelSummaryRow(bucket: bucket, index: index, share: bucket.costUSD / maxCost)
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -8).isActive = true
+        }
+        if buckets.count > rowRenderCap {
+            appendOverflowRow(hidden: buckets.count - rowRenderCap)
+        }
+    }
+
+    private func appendModelHeader(count: Int, totalTokens: Int, totalCost: Double) {
+        let label = NSTextField(labelWithString:
+            "\(count) models · this month · \(NumberFormatting.compactTokens(totalTokens)) tk · "
+                + "\(NumberFormatting.compactDollars(totalCost))")
+        label.font = Theme.bodyFont(size: 11)
+        label.textColor = Theme.textSecondary
+        label.translatesAutoresizingMaskIntoConstraints = false
+        let wrapper = NSView()
+        wrapper.translatesAutoresizingMaskIntoConstraints = false
+        wrapper.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: wrapper.topAnchor, constant: 4),
+            label.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor, constant: -8),
+            label.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor, constant: -4)
+        ])
+        stack.addArrangedSubview(wrapper)
+        wrapper.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -8).isActive = true
+    }
+
+    private func makeModelSummaryRow(bucket: AggregateBucket, index: Int, share: Double) -> NSView {
+        let palette = [Theme.accentBlue, Theme.accentMint, Theme.accentPeach, Theme.accentLime, Theme.accentRed]
+        let color = palette[index % palette.count]
+
+        let row = NSView()
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 8
+        row.layer?.backgroundColor = Theme.surface.withAlphaComponent(0.55).cgColor
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        // Cost-share bar behind the text — a quick visual weight per model.
+        let bar = NSView()
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = color.withAlphaComponent(0.16).cgColor
+        bar.layer?.cornerRadius = 8
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(bar)
+
+        let dot = NSView()
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = color.cgColor
+        dot.layer?.cornerRadius = 4
+        dot.translatesAutoresizingMaskIntoConstraints = false
+
+        let name = NSTextField(labelWithString: BurnFormatting.shortModel(bucket.id))
+        name.font = Theme.bodyFont(size: 12)
+        name.textColor = Theme.textPrimary
+        name.lineBreakMode = .byTruncatingTail
+        name.translatesAutoresizingMaskIntoConstraints = false
+
+        let tokens = NSTextField(labelWithString: "\(NumberFormatting.compactTokens(bucket.totalTokens)) tk")
+        tokens.font = Theme.numericFont(size: 12)
+        tokens.textColor = Theme.textSecondary
+        tokens.translatesAutoresizingMaskIntoConstraints = false
+
+        let cost = NSTextField(labelWithString: NumberFormatting.compactDollars(bucket.costUSD))
+        cost.font = Theme.numericFont(size: 13)
+        cost.textColor = color
+        cost.translatesAutoresizingMaskIntoConstraints = false
+
+        row.addSubview(dot)
+        row.addSubview(name)
+        row.addSubview(tokens)
+        row.addSubview(cost)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 30),
+            bar.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            bar.topAnchor.constraint(equalTo: row.topAnchor),
+            bar.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            bar.widthAnchor.constraint(equalTo: row.widthAnchor, multiplier: max(0.02, min(1, CGFloat(share)))),
+
+            dot.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            dot.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            dot.widthAnchor.constraint(equalToConstant: 8),
+            dot.heightAnchor.constraint(equalToConstant: 8),
+
+            name.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 8),
+            name.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+
+            cost.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+            cost.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+
+            tokens.trailingAnchor.constraint(equalTo: cost.leadingAnchor, constant: -12),
+            tokens.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            name.trailingAnchor.constraint(lessThanOrEqualTo: tokens.leadingAnchor, constant: -8)
+        ])
+        return row
+    }
+
     private func shortSession(_ id: String) -> String {
         guard id.count > 12 else { return id }
         let head = id.prefix(8)
@@ -928,13 +1103,6 @@ final class MetricsViewController: NSViewController {
         f.dateFormat = "HH:mm"
         return f
     }()
-
-    private func updateRowsInPlace(buckets: [AggregateBucket]) {
-        // Same id list, same mode — only the underlying tokens/cost numbers may have moved.
-        // We rebuild rather than mutate-in-place because BucketRowView is single-shot today,
-        // but cap the work to the visible window so it stays cheap.
-        renderRows(buckets)
-    }
 
     private func makeOverflowRow(hidden: Int) -> NSView {
         let row = NSView()
@@ -1007,11 +1175,23 @@ final class MetricsViewController: NSViewController {
         default: Theme.accentRed
         }
     }
+
+    /// Tier color for a $/hr burn rate — matches the heartbeat sparkline's tiers so the orb and the
+    /// billing curve read the same temperature.
+    private func costTierColor(_ dollarsPerHour: Double) -> NSColor {
+        switch dollarsPerHour {
+        case ..<0.05: Theme.accentBlue
+        case 0.05 ..< 1: Theme.accentMint
+        case 1 ..< 5: Theme.accentPeach
+        default: Theme.accentRed
+        }
+    }
 }
 
 extension ViewMode {
     var symbolName: String {
         switch self {
+        case .models: "cpu"
         case .day: "calendar"
         case .week: "calendar.badge.clock"
         case .month: "square.grid.3x3.fill"
@@ -1770,6 +1950,9 @@ private final class SectionDivider: NSView {
     private let line = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let statLabel = NSTextField(labelWithString: "")
+    /// Local-refresh pulse orb — this section header owns the LOCAL metrics signal (distinct from
+    /// the OAuth orb on the billing graph above).
+    private let orb = PulseOrbView()
 
     init(title: String) {
         super.init(frame: .zero)
@@ -1789,6 +1972,10 @@ private final class SectionDivider: NSView {
         statLabel.alignment = .right
         statLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        orb.translatesAutoresizingMaskIntoConstraints = false
+        orb.toolTip = "Pulses on each local refresh while open"
+
+        addSubview(orb)
         addSubview(titleLabel)
         addSubview(statLabel)
         addSubview(line)
@@ -1796,8 +1983,14 @@ private final class SectionDivider: NSView {
             titleLabel.topAnchor.constraint(equalTo: topAnchor),
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
 
+            // Orb on the right (mirrors the OAuth graph's orb placement); rate sits just left of it.
+            orb.trailingAnchor.constraint(equalTo: trailingAnchor),
+            orb.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            orb.widthAnchor.constraint(equalToConstant: 11),
+            orb.heightAnchor.constraint(equalToConstant: 11),
+
             statLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            statLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+            statLabel.trailingAnchor.constraint(equalTo: orb.leadingAnchor, constant: -8),
             statLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 8),
 
             line.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
@@ -1815,6 +2008,14 @@ private final class SectionDivider: NSView {
 
     func update(stat: String) {
         statLabel.stringValue = stat
+    }
+
+    func pulse() {
+        orb.pulse(.strong)
+    }
+
+    func setOrbAccent(_ color: NSColor) {
+        orb.setAccent(color)
     }
 }
 

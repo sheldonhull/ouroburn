@@ -111,6 +111,12 @@ actor BillingService {
         baselinePollInterval = clamped * 60
     }
 
+    /// Timestamp of the last successful network fetch. The tracker pulses the OAuth orb only when
+    /// this advances — i.e. an actual upstream refresh occurred, not every 30s billing tick.
+    func lastFetchTime() -> Date? {
+        lastFetchedAt
+    }
+
     func currentMonthBilledUSD() async -> Double? {
         let claudeCodeToken = await resolveClaudeCodeOAuthToken()
         let oauthToken = resolveSecret(envKey: "CLAUDE_OAUTH_TOKEN", account: SecretsAccount.claudeOAuth)

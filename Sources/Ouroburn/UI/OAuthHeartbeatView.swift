@@ -40,6 +40,9 @@ final class OAuthHeartbeatView: NSView {
 
     private let titleLabel = NSTextField(labelWithString: "")
     private let canvas = HeartbeatCanvas()
+    /// OAuth-refresh pulse orb — lives on the billing graph header. Soft blip when a real upstream
+    /// fetch lands.
+    private let orb = PulseOrbView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -59,6 +62,11 @@ final class OAuthHeartbeatView: NSView {
     func update(samples raw: [BillingSample]) {
         allSamples = raw.sorted { $0.timestamp < $1.timestamp }
         rebuild()
+    }
+
+    /// Soft pulse when a real OAuth upstream fetch lands (driven from the tracker).
+    func pulseRefresh() {
+        orb.pulse(.soft)
     }
 
     /// Switch the displayed range (driven by hero-tile hover). No-op when unchanged.
@@ -233,11 +241,19 @@ final class OAuthHeartbeatView: NSView {
     private func configureSubviews() {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         canvas.translatesAutoresizingMaskIntoConstraints = false
+        orb.translatesAutoresizingMaskIntoConstraints = false
+        orb.setAccent(Theme.accentMint)
 
         addSubview(titleLabel)
         addSubview(canvas)
+        addSubview(orb)
 
         NSLayoutConstraint.activate([
+            orb.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            orb.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            orb.widthAnchor.constraint(equalToConstant: 13),
+            orb.heightAnchor.constraint(equalToConstant: 13),
+
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
 
@@ -352,8 +368,45 @@ private final class HeartbeatCanvas: NSView {
         positions = computePositions(rect: plot)
         drawSparkline(in: ctx, rect: plot)
         drawTicks(in: ctx, rect: plot)
+        drawBeatValues(in: ctx, rect: plot)
         if let hoveredIndex {
             drawHoverIndicator(in: ctx, rect: plot, index: hoveredIndex)
+        }
+    }
+
+    /// Value labels above beats: the trailing few always, plus a ±5 window around the cursor on
+    /// hover. Zero-spend buckets are skipped and collisions dropped so the line stays legible.
+    private func drawBeatValues(in _: CGContext, rect: NSRect) {
+        guard positions.count == beats.count, beats.count > 1 else { return }
+        var indices = Set<Int>()
+        for i in Swift.max(0, beats.count - 5) ..< beats.count where beats[i].dollars > 0.0001 {
+            indices.insert(i)
+        }
+        if let hoveredIndex {
+            let lo = Swift.max(0, hoveredIndex - 5)
+            let hi = Swift.min(beats.count - 1, hoveredIndex + 5)
+            for i in lo ... hi where beats[i].dollars > 0.0001 {
+                indices.insert(i)
+            }
+        }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: Theme.numericFont(size: 8),
+            .foregroundColor: accentColor()
+        ]
+        var lastMaxX = -CGFloat.greatestFiniteMagnitude
+        for index in indices.sorted() {
+            let pos = positions[index]
+            let str = NSAttributedString(
+                string: NumberFormatting.compactDollars(beats[index].dollars),
+                attributes: attrs
+            )
+            let size = str.size()
+            let x = Swift.min(Swift.max(pos.x - size.width / 2, rect.minX), rect.maxX - size.width)
+            guard x > lastMaxX + 3 else { continue }
+            let above = pos.y + 4
+            let y = above + size.height <= rect.maxY ? above : Swift.max(pos.y - size.height - 4, rect.minY)
+            str.draw(at: CGPoint(x: x, y: y))
+            lastMaxX = x + size.width
         }
     }
 

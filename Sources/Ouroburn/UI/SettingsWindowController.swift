@@ -17,6 +17,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let adminIndicator = StatusDot()
     private let cooldownField = NSTextField()
     private let oauthIntervalField = NSTextField()
+    private let localRefreshField = NSTextField()
     private let modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let toastPeakAlertSwitch = NSSwitch()
     private let toastPeakMinimumField = NSTextField()
@@ -297,6 +298,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         oauthIntervalField.placeholderString = "5"
         oauthIntervalField.alignment = .right
 
+        localRefreshField.translatesAutoresizingMaskIntoConstraints = false
+        localRefreshField.placeholderString = "5"
+        localRefreshField.alignment = .right
+
         modePopup.translatesAutoresizingMaskIntoConstraints = false
         for mode in ViewMode.allCases {
             modePopup.addItem(withTitle: mode.title)
@@ -309,6 +314,11 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
                 "OAuth refresh (min)",
                 control: oauthIntervalField,
                 hint: "1–60 baseline · expo backoff up to 15"
+            ),
+            inlineRow(
+                "Local refresh (s)",
+                control: localRefreshField,
+                hint: "2–30 · live tick while open, in focus only"
             ),
             inlineRow("Default view", control: modePopup, hint: "loaded on launch")
         ])
@@ -558,6 +568,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let prefs = PreferencesStore.load()
         cooldownField.stringValue = String(Int(prefs.notificationCooldownSeconds))
         oauthIntervalField.stringValue = String(Int(prefs.oauthRefreshMinutes))
+        localRefreshField.stringValue = String(Int(prefs.localRefreshSeconds))
         toastPeakAlertSwitch.state = prefs.toastPeakAlertEnabled ? .on : .off
         toastPeakMinimumField.stringValue = String(format: "%.2f", prefs.toastPeakMinimumUSDPerHour)
         projectionEnabledSwitch.state = prefs.monthlyProjectionAlertEnabled ? .on : .off
@@ -579,6 +590,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     @objc private func savePressed() {
         let cooldown = Double(cooldownField.stringValue) ?? Preferences.default.notificationCooldownSeconds
         let oauthInterval = Double(oauthIntervalField.stringValue) ?? Preferences.default.oauthRefreshMinutes
+        let localRefresh = Double(localRefreshField.stringValue) ?? Preferences.default.localRefreshSeconds
         let mode = ViewMode.allCases[modePopup.indexOfSelectedItem]
         let toastPeakMinimum = Double(toastPeakMinimumField.stringValue)
             ?? Preferences.default.toastPeakMinimumUSDPerHour
@@ -592,6 +604,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             defaultMode: mode,
             notificationCooldownSeconds: max(60, cooldown),
             oauthRefreshMinutes: min(max(1, oauthInterval), 60),
+            localRefreshSeconds: min(max(2, localRefresh), 30),
             toastPeakAlertEnabled: toastPeakAlertSwitch.state == .on,
             toastPeakMinimumUSDPerHour: max(0, toastPeakMinimum),
             monthlyProjectionAlertEnabled: projectionEnabledSwitch.state == .on,

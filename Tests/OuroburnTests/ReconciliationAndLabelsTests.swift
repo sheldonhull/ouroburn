@@ -62,6 +62,7 @@ struct ReconciliationAndLabelsTests {
             medianTokensPerMinute: 0,
             previousTokensPerMinute: 0,
             costPerHour: 0,
+            medianCostPerHour: 0,
             todayTokens: 0,
             todayCostUSD: 0,
             weekTokens: 0,

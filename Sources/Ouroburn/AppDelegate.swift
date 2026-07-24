@@ -47,6 +47,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tracker.onBillingHealth = { [weak statusBar] health in
             DispatchQueue.main.async { statusBar?.applyBillingHealth(health) }
         }
+        tracker.onOAuthPulse = { [weak statusBar] in
+            DispatchQueue.main.async { statusBar?.pulseOAuth() }
+        }
+        tracker.onLocalPulse = { [weak statusBar] in
+            DispatchQueue.main.async { statusBar?.pulseLocal() }
+        }
         tracker.onToast = { event in
             DispatchQueue.main.async {
                 let (title, message, accent): (String, String, NSColor)

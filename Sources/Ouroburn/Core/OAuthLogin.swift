@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Network
+import os
 
 /// OAuth 2.0 Authorization Code Flow with PKCE (RFC 7636) against Anthropic's Claude
 /// authentication, mirroring `claude-proxy/internal/oauth/login.go`. Constants are
@@ -173,10 +174,29 @@ struct StoredCredential: Codable, Sendable {
 }
 
 /// Persists `StoredCredential` values to the macOS keychain under a single account entry.
+///
+/// `load()` is read from several launch paths at once (status bar probe, billing fetch, popover
+/// render). Each raw `SecItemCopyMatching` can raise its own macOS access prompt, so a naive
+/// implementation fired duplicate prompts back-to-back. The in-memory cache below is filled under
+/// a lock: the first caller performs the single keychain read (one prompt), concurrent callers
+/// block on the lock and then reuse the cached value — no second prompt for this item.
 enum OAuthCredentialStore {
     private static let account = SecretsAccount.ouroburnOAuth
+    private static let cache = OSAllocatedUnfairLock<(loaded: Bool, value: StoredCredential?)>(
+        initialState: (loaded: false, value: nil)
+    )
 
     static func load() -> StoredCredential? {
+        cache.withLock { state in
+            if !state.loaded {
+                state.value = readFromKeychain()
+                state.loaded = true
+            }
+            return state.value
+        }
+    }
+
+    private static func readFromKeychain() -> StoredCredential? {
         guard let raw = Keychain.read(account: account),
               let data = raw.data(using: .utf8) else { return nil }
         let decoder = JSONDecoder()
@@ -190,10 +210,12 @@ enum OAuthCredentialStore {
         guard let data = try? encoder.encode(credential),
               let raw = String(data: data, encoding: .utf8) else { return }
         Keychain.write(account: account, value: raw)
+        cache.withLock { $0 = (loaded: true, value: credential) }
     }
 
     static func clear() {
         Keychain.delete(account: account)
+        cache.withLock { $0 = (loaded: true, value: nil) }
     }
 }
 

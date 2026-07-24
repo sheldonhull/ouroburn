@@ -112,6 +112,16 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
         }
     }
 
+    /// Soft orb pulse — a real OAuth upstream fetch landed while the popover is open.
+    func pulseOAuth() {
+        metrics.pulseOAuthOrb()
+    }
+
+    /// Stronger neon radial pulse — a local live refresh tick fired while the popover is open.
+    func pulseLocal() {
+        metrics.pulseLocalOrb()
+    }
+
     @objc private func handleClick(_: Any?) {
         let event = NSApp.currentEvent
         if event?.type == .rightMouseUp {
@@ -126,7 +136,11 @@ final class StatusBarController: NSObject, NSMenuItemValidation {
         if popover.isShown {
             popover.performClose(nil)
             tracker.stopLiveTracking()
+            // Stop background JSONL polls — nobody's looking. Billing/alert polls keep running.
+            tracker.setPopoverVisible(false)
         } else {
+            // Open path is in view: let background polls run again, then pull a fresh one.
+            tracker.setPopoverVisible(true)
             // Refresh the live priority panel from the cached snapshot before the popover slides
             // in so the OAuth heartbeat + top-5 sessions read fresh on every open.
             metrics.popoverWillShow()

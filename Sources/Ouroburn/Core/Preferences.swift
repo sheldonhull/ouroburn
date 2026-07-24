@@ -8,6 +8,10 @@ struct Preferences: Sendable {
     /// Baseline interval (minutes) between Anthropic OAuth spend pulls. Floors at 1, ceilings at
     /// 60. Failed fetches escalate up to `oauthRefreshMaxMinutes` via exponential backoff.
     var oauthRefreshMinutes: Double
+    /// Seconds between local-transcript (JSONL) live refreshes while the popover is open. Drives
+    /// the live tick + the local-refresh pulse. Floors at 2, ceilings at 30. Only runs in focus —
+    /// closed popover pays no incremental I/O.
+    var localRefreshSeconds: Double
     /// Toast on every newly-observed peak in today's per-interval OAuth spend delta — the day's
     /// peak spend rate. Shows the last sample's dollars and how long it covered.
     var toastPeakAlertEnabled: Bool
@@ -25,9 +29,10 @@ struct Preferences: Sendable {
     static let oauthRefreshMaxMinutes: Double = 15
 
     static let `default` = Preferences(
-        defaultMode: .session,
+        defaultMode: .models,
         notificationCooldownSeconds: 600,
         oauthRefreshMinutes: 5,
+        localRefreshSeconds: 5,
         toastPeakAlertEnabled: true,
         toastPeakMinimumUSDPerHour: 5,
         monthlyProjectionAlertEnabled: true,
@@ -44,6 +49,7 @@ enum PreferencesStore {
         static let defaultMode = "ouroburn.defaultMode"
         static let notificationCooldown = "ouroburn.notificationCooldown"
         static let oauthRefreshMinutes = "ouroburn.oauthRefreshMinutes"
+        static let localRefreshSeconds = "ouroburn.localRefreshSeconds"
         static let toastPeakAlertEnabled = "ouroburn.toastPeakAlertEnabled"
         static let toastPeakMinimum = "ouroburn.toastPeakMinimumUSDPerHour"
         static let projectionAlertEnabled = "ouroburn.monthlyProjectionAlertEnabled"
@@ -64,6 +70,9 @@ enum PreferencesStore {
         }
         if defaults.object(forKey: Key.oauthRefreshMinutes) != nil {
             prefs.oauthRefreshMinutes = defaults.double(forKey: Key.oauthRefreshMinutes)
+        }
+        if defaults.object(forKey: Key.localRefreshSeconds) != nil {
+            prefs.localRefreshSeconds = defaults.double(forKey: Key.localRefreshSeconds)
         }
         if defaults.object(forKey: Key.toastPeakAlertEnabled) != nil {
             prefs.toastPeakAlertEnabled = defaults.bool(forKey: Key.toastPeakAlertEnabled)
@@ -90,6 +99,7 @@ enum PreferencesStore {
         defaults.set(prefs.defaultMode.rawValue, forKey: Key.defaultMode)
         defaults.set(prefs.notificationCooldownSeconds, forKey: Key.notificationCooldown)
         defaults.set(prefs.oauthRefreshMinutes, forKey: Key.oauthRefreshMinutes)
+        defaults.set(prefs.localRefreshSeconds, forKey: Key.localRefreshSeconds)
         defaults.set(prefs.toastPeakAlertEnabled, forKey: Key.toastPeakAlertEnabled)
         defaults.set(prefs.toastPeakMinimumUSDPerHour, forKey: Key.toastPeakMinimum)
         defaults.set(prefs.monthlyProjectionAlertEnabled, forKey: Key.projectionAlertEnabled)

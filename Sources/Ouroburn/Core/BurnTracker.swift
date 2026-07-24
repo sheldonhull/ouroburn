@@ -30,6 +30,9 @@ struct TrackerSnapshot: Sendable {
     let medianTokensPerMinute: Double
     let previousTokensPerMinute: Double
     let costPerHour: Double
+    /// Median local JSONL $/hr over the trailing ~30 min (30 polls). Stable "recent cost pace"
+    /// for the meter, resisting the single-poll swings the 5-min `costPerHour` shows.
+    let medianCostPerHour: Double
 
     /// Always-current hero stats (independent of selected view mode).
     let todayTokens: Int
@@ -127,6 +130,7 @@ struct TrackerSnapshot: Sendable {
             medianTokensPerMinute: medianTokensPerMinute,
             previousTokensPerMinute: previousTokensPerMinute,
             costPerHour: costPerHour,
+            medianCostPerHour: medianCostPerHour,
             todayTokens: todayTokens,
             todayCostUSD: todayCostUSD,
             weekTokens: weekTokens,
@@ -200,7 +204,7 @@ enum ToastEvent: Sendable {
 final class BurnTracker: @unchecked Sendable {
     var onUpdate: ((TrackerSnapshot) -> Void)?
     var onRefreshStateChanged: ((RefreshState) -> Void)?
-    /// Fires every `liveTickInterval` while the popover is shown. Replaces nothing — strictly
+    /// Fires every `localRefreshSeconds` while the popover is shown. Replaces nothing — strictly
     /// additive over the 60s `onUpdate` snapshot.
     var onLiveUpdate: ((LiveSnapshot) -> Void)?
     /// Fires once per breach when live USD/hr stays at/above threshold for the sustained window.
@@ -216,11 +220,16 @@ final class BurnTracker: @unchecked Sendable {
     /// Fires after pricing loads or refreshes, carrying the feed's load time so the popover footer
     /// can show its age. Delivered off the main thread — dispatch before touching UI.
     var onPricingStatus: ((Date?) -> Void)?
+    /// Fires when a fresh OAuth billing sample lands while the popover is in view — drives the
+    /// soft orb pulse. Off the main thread; dispatch before touching UI.
+    var onOAuthPulse: (() -> Void)?
+    /// Fires on each local live-refresh tick while the popover is in view — drives the stronger
+    /// neon radial pulse. Off the main thread; dispatch before touching UI.
+    var onLocalPulse: (() -> Void)?
 
     static let pollInterval: TimeInterval = 60
     static let burnWindowSeconds: TimeInterval = 5 * 60
     static let billingTickInterval: TimeInterval = 30
-    static let liveTickInterval: TimeInterval = 4
     /// Min interval between `entries.plist` writes. Cap to avoid hammering the disk on hot
     /// sessions where every poll updates a couple files. 2 min is plenty — relaunch cost-savings
     /// scale with `(time since last save)`, not write frequency.
@@ -256,6 +265,8 @@ final class BurnTracker: @unchecked Sendable {
         var fileCache: [URL: CachedFile] = [:]
         /// Rolling rate samples used to compute a stable median (resists single-poll spikes).
         var rateHistory: [Double] = []
+        /// Parallel rolling window of local $/hr samples for the 30m median cost meter.
+        var costHistory: [Double] = []
         /// Latest known admin-API billing total. Sticky between polls.
         var billedMonthUSD: Double?
         /// Latest billing status string surfaced into the popover footer (rate-limited, auth
@@ -295,6 +306,16 @@ final class BurnTracker: @unchecked Sendable {
         /// Last time the file-cache was persisted to disk. Throttles the ~30-60 MB binary-plist
         /// write to once per `entriesPersistInterval`.
         var lastEntriesPersistedAt: Date?
+        /// True while the popover is open. Background timer/watcher JSONL polls no-op when false so
+        /// we don't burn cores aggregating 250k entries nobody is looking at. Billing (alert) polls
+        /// keep running regardless. Set via `setPopoverVisible`.
+        var popoverVisible: Bool = false
+        /// Live-tick cadence (seconds) mirrored from `Preferences.localRefreshSeconds`. Read when
+        /// `startLiveTracking` arms the timer.
+        var localRefreshSeconds: Double = 5
+        /// Last successful-fetch timestamp we pulsed the OAuth orb for. Prevents re-pulsing on the
+        /// 30s billing ticks that don't actually hit the network (throttled).
+        var lastPulsedFetchAt: Date?
     }
 
     func applyPreferences(_ prefs: Preferences) {
@@ -305,6 +326,7 @@ final class BurnTracker: @unchecked Sendable {
             $0.projectionThresholdUSD = prefs.monthlyProjectionThresholdUSD
             $0.projectionMinTodayUSD = prefs.monthlyProjectionMinTodayUSD
             $0.notificationCooldownSeconds = prefs.notificationCooldownSeconds
+            $0.localRefreshSeconds = min(max(prefs.localRefreshSeconds, 2), 30)
         }
         if let billingService {
             Task { await billingService.setPollInterval(minutes: prefs.oauthRefreshMinutes) }
@@ -339,6 +361,13 @@ final class BurnTracker: @unchecked Sendable {
         state.withLock { $0.activeMode = mode }
     }
 
+    /// Popover visibility gate. When closed, background timer/watcher polls skip the full JSONL
+    /// merge/aggregate (nobody's watching); the popover-open path always fires a fresh `.timer`
+    /// poll after flipping this true, so tiles are current the moment they're seen.
+    func setPopoverVisible(_ visible: Bool) {
+        state.withLock { $0.popoverVisible = visible }
+    }
+
     func bootstrapFromCache() -> TrackerSnapshot? {
         guard let cached = cache.load() else { return nil }
         let mode = ViewMode(rawValue: cached.mode) ?? .day
@@ -369,6 +398,7 @@ final class BurnTracker: @unchecked Sendable {
             medianTokensPerMinute: cached.medianTokensPerMinute ?? cached.burnRatePerMinute,
             previousTokensPerMinute: cached.burnRatePerMinute,
             costPerHour: cached.costPerHour ?? 0,
+            medianCostPerHour: cached.costPerHour ?? 0,
             todayTokens: cached.todayTokens ?? 0,
             todayCostUSD: cached.todayCostUSD ?? 0,
             weekTokens: cached.weekTokens ?? 0,
@@ -515,37 +545,41 @@ final class BurnTracker: @unchecked Sendable {
     /// Starts the 2s live ticker. Tail-reads only new JSONL bytes; rolling 60s window. Cheap
     /// because it walks file sizes without parsing existing content. Caller (status bar) invokes
     /// this on popover-open and pairs it with `stopLiveTracking()` on close.
-    /// Seed offsets + start the 2s timer. Runs synchronously on the caller's thread (main, when
-    /// invoked from the popover-open path). Earlier versions bounced between `liveQueue.async`
-    /// and `DispatchQueue.main.async`, which crashed under Swift 6 strict-concurrency isolation
-    /// checks when called from a `@MainActor` context.
+    /// Seed offsets + start the live timer. All work — the transcript walk (~2k `stat`s) and the
+    /// timer arm — runs on `liveQueue`, never the caller's (main) thread, so popover-open doesn't
+    /// block on file I/O. Cadence comes from `Preferences.localRefreshSeconds`. All `liveTimer`
+    /// access stays on `liveQueue` (start + stop), so there's no cross-thread race and no main hop
+    /// to trip Swift 6 isolation checks.
     func startLiveTracking() {
-        let files = loader.transcriptFiles()
-        let seeded: [URL: UInt64] = files.reduce(into: [:]) { acc, url in
-            acc[url] = loader.currentSize(of: url)
+        liveQueue.async { [weak self] in
+            guard let self else { return }
+            let files = loader.transcriptFiles()
+            let seeded: [URL: UInt64] = files.reduce(into: [:]) { acc, url in
+                acc[url] = loader.currentSize(of: url)
+            }
+            let interval = state.withLock { state -> Double in
+                state.liveOffsets = seeded
+                state.liveSamples = []
+                return state.localRefreshSeconds
+            }
+            liveTimer?.cancel()
+            let timer = DispatchSource.makeTimerSource(queue: liveQueue)
+            timer.schedule(deadline: .now() + interval, repeating: interval)
+            timer.setEventHandler { [weak self] in self?.liveTick() }
+            timer.resume()
+            liveTimer = timer
         }
-        state.withLock { state in
-            state.liveOffsets = seeded
-            state.liveSamples = []
-        }
-
-        liveTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: liveQueue)
-        timer.schedule(
-            deadline: .now() + Self.liveTickInterval,
-            repeating: Self.liveTickInterval
-        )
-        timer.setEventHandler { [weak self] in self?.liveTick() }
-        timer.resume()
-        liveTimer = timer
     }
 
     func stopLiveTracking() {
-        liveTimer?.cancel()
-        liveTimer = nil
-        state.withLock { state in
-            state.liveOffsets = [:]
-            state.liveSamples = []
+        liveQueue.async { [weak self] in
+            guard let self else { return }
+            liveTimer?.cancel()
+            liveTimer = nil
+            state.withLock { state in
+                state.liveOffsets = [:]
+                state.liveSamples = []
+            }
         }
     }
 
@@ -585,6 +619,8 @@ final class BurnTracker: @unchecked Sendable {
             return Self.computeLive(samples: state.liveSamples, table: table, now: now)
         }
         onLiveUpdate?(live)
+        // Each live tick IS a local refresh — pulse the stronger neon radial while in view.
+        if state.withLock({ $0.popoverVisible }) { onLocalPulse?() }
     }
 
     private static func liveCost(for entry: UsageEntry, table: [String: ModelPricing]) -> Double {
@@ -714,6 +750,17 @@ final class BurnTracker: @unchecked Sendable {
             }
             if let updated { onUpdate?(updated) }
             onBillingHealth?(health)
+            // Pulse the OAuth orb only when a real upstream fetch landed (fetchedAt advanced) and
+            // the popover is in view — not on every throttled 30s tick.
+            let fetchedAt = await billingService.lastFetchTime()
+            let shouldPulse = state.withLock { state -> Bool in
+                guard state.popoverVisible, let fetchedAt, fetchedAt != state.lastPulsedFetchAt else {
+                    return false
+                }
+                state.lastPulsedFetchAt = fetchedAt
+                return true
+            }
+            if shouldPulse { onOAuthPulse?() }
             checkDailyPeak()
             checkMonthlyProjection(samples: billingSamples, monthToDateUSD: total, now: now)
         }
@@ -1123,14 +1170,23 @@ final class BurnTracker: @unchecked Sendable {
     }
 
     private func poll(trigger: Trigger = .timer) {
+        // Focus gate: skip background timer/watcher polls when the popover is closed. The open
+        // path flips `popoverVisible` true then fires a `.timer` poll, so opening always refreshes.
+        // `.force` (menu "Refresh now") bypasses the gate. Billing/alert polls run on their own
+        // timer and are unaffected.
+        if trigger != .force, !state.withLock({ $0.popoverVisible }) {
+            Log.debug(Log.tracker, "Poll skipped (popover closed — background gate)")
+            return
+        }
         if trigger == .watcher {
             let lastPollAt = state.withLock { $0.lastPollAt }
             // Watcher-triggered polls are expensive (merge + dedup + 4× aggregate over the full
             // entry set) and an active Claude Code session writes JSONL many times per second.
-            // The 2s live tick keeps the menu-bar tooltip + headline rate fresh; tile totals
-            // can wait. Hard-floor watcher polls at 20s. The 60s safety timer still ticks.
-            if let last = lastPollAt, Date().timeIntervalSince(last) < 20 {
-                Log.debug(Log.tracker, "Poll skipped (watcher within 20s of last poll)")
+            // Watcher polls only run while the popover is open (background gate above), so an 8s
+            // floor keeps the session tree + tiles refreshing promptly as you code without a full
+            // reaggregate on every FSEvent. The 60s safety timer still ticks.
+            if let last = lastPollAt, Date().timeIntervalSince(last) < 8 {
+                Log.debug(Log.tracker, "Poll skipped (watcher within 8s of last poll)")
                 return
             }
         }
@@ -1228,10 +1284,19 @@ final class BurnTracker: @unchecked Sendable {
         // so the session graph keeps its trailing-7-day trend context.
         let startOfToday = Calendar.current.startOfDay(for: now)
         let todayEntries = entries.filter { $0.timestamp >= startOfToday }
+        let monthStart = Calendar.current.date(from: Calendar.current.dateComponents([.year, .month], from: now))
+            ?? startOfToday
+        let monthEntries = entries.filter { $0.timestamp >= monthStart }
         var bucketsByMode: [ViewMode: [AggregateBucket]] = [:]
         var timelinesByMode: [ViewMode: [TimelinePoint]] = [:]
         for viewMode in ViewMode.allCases {
-            let bucketEntries = viewMode == .session ? todayEntries : entries
+            // Session mode is scoped to today; the Models leaderboard to the current month; the
+            // rest span full history so their timelines keep trend context.
+            let bucketEntries: [UsageEntry] = switch viewMode {
+            case .session: todayEntries
+            case .models: monthEntries
+            default: entries
+            }
             bucketsByMode[viewMode] = aggregator.aggregate(entries: bucketEntries, mode: viewMode, now: now)
             timelinesByMode[viewMode] = aggregator.timeline(entries: entries, mode: viewMode, now: now)
         }
@@ -1263,6 +1328,18 @@ final class BurnTracker: @unchecked Sendable {
         }()
         let median = Self.median(of: nextHistory)
 
+        // Parallel 30m rolling window for the local cost meter.
+        let priorCostHistory = state.withLock { $0.costHistory }
+        let nextCostHistory: [Double] = {
+            var out = priorCostHistory
+            out.append(costPerHour)
+            if out.count > Self.rateHistoryDepth {
+                out.removeFirst(out.count - Self.rateHistoryDepth)
+            }
+            return out
+        }()
+        let medianCost = Self.median(of: nextCostHistory)
+
         let (billedSoFar, billingStatusSoFar) = state.withLock {
             ($0.billedMonthUSD, $0.billingStatusMessage)
         }
@@ -1278,6 +1355,7 @@ final class BurnTracker: @unchecked Sendable {
             medianTokensPerMinute: median,
             previousTokensPerMinute: previous,
             costPerHour: costPerHour,
+            medianCostPerHour: medianCost,
             todayTokens: todayBucket?.totalTokens ?? 0,
             todayCostUSD: todayBucket?.costUSD ?? 0,
             weekTokens: weekBucket?.totalTokens ?? 0,
@@ -1299,6 +1377,7 @@ final class BurnTracker: @unchecked Sendable {
             $0.lastSnapshot = snapshot
             $0.fileCache = updatedCache
             $0.rateHistory = nextHistory
+            $0.costHistory = nextCostHistory
             $0.lastFileFingerprint = fingerprint
         }
 

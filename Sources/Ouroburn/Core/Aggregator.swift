@@ -37,6 +37,7 @@ struct Aggregator {
 
     func aggregate(entries: [UsageEntry], mode: ViewMode, now: Date = Date()) -> [AggregateBucket] {
         switch mode {
+        case .models: groupByModel(entries)
         case .day: groupByDateString(entries) { Self.dayKey(for: $0, calendar: calendar) }
         case .week: groupByDateString(entries) { Self.weekKey(for: $0, calendar: calendar, weekStart: weekStart) }
         case .month: groupByDateString(entries) { Self.monthKey(for: $0, calendar: calendar) }
@@ -55,6 +56,11 @@ struct Aggregator {
     /// hourly for day/sessionBlock, daily for week/month. Session mode skips the graph.
     func timeline(entries: [UsageEntry], mode: ViewMode, now: Date = Date()) -> [TimelinePoint] {
         switch mode {
+        case .models:
+            // Models tab is a leaderboard, not a time series — reuse the month trend so the graph
+            // still shows the month's shape.
+            let dayCount = daysInCurrentMonth(now)
+            return dailyTimeline(entries: entries, anchor: startOfMonth(now), days: dayCount)
         case .day:
             return hourlyTimeline(entries: entries, anchor: startOfDay(now), hours: 24)
         case .sessionBlock:
@@ -150,6 +156,17 @@ struct Aggregator {
             buckets[id, default: BucketAccumulator(id: id, key: id)].add(entry, cost: cost(of: entry))
         }
         return buckets.values.map { $0.finalize() }.sorted { $0.id > $1.id }
+    }
+
+    /// One bucket per model — the Models tab's spend leaderboard. Callers pass already
+    /// month-scoped entries; sorted by cost desc so the priciest model floats to top.
+    private func groupByModel(_ entries: [UsageEntry]) -> [AggregateBucket] {
+        var buckets: [String: BucketAccumulator] = [:]
+        for entry in entries {
+            let id = entry.model ?? "unknown"
+            buckets[id, default: BucketAccumulator(id: id, key: id)].add(entry, cost: cost(of: entry))
+        }
+        return buckets.values.map { $0.finalize() }.sorted { $0.costUSD > $1.costUSD }
     }
 
     private func groupBySession(_ entries: [UsageEntry]) -> [AggregateBucket] {

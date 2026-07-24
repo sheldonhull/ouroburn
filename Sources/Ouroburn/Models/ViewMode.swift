@@ -1,6 +1,7 @@
 import Foundation
 
 enum ViewMode: String, CaseIterable, Sendable {
+    case models
     case day
     case week
     case month
@@ -9,6 +10,7 @@ enum ViewMode: String, CaseIterable, Sendable {
 
     var title: String {
         switch self {
+        case .models: "Models"
         case .day: "Daily"
         case .week: "Weekly"
         case .month: "Monthly"

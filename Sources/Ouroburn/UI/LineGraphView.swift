@@ -104,6 +104,7 @@ final class LineGraphView: NSView {
         }
         drawAxisLabels(in: ctx, rect: plotRect)
         drawLine(in: ctx, rect: plotRect)
+        drawPointValues(in: ctx, rect: plotRect)
         if let hoveredIndex {
             drawHoverIndicator(in: ctx, rect: plotRect, index: hoveredIndex)
         }
@@ -184,10 +185,73 @@ final class LineGraphView: NSView {
         NSAttributedString(string: maxLabel, attributes: attrs).draw(at: CGPoint(x: rect.minX, y: rect.maxY - 2))
 
         let firstStr = NSAttributedString(string: points.first?.label ?? "", attributes: attrs)
+        let firstSize = firstStr.size()
         firstStr.draw(at: CGPoint(x: rect.minX, y: rect.minY - 14))
         let lastStr = NSAttributedString(string: points.last?.label ?? "", attributes: attrs)
         let lastSize = lastStr.size()
         lastStr.draw(at: CGPoint(x: rect.maxX - lastSize.width, y: rect.minY - 14))
+
+        // A few evenly-spaced interior date references so the x-axis reads as a timeframe without
+        // overload. Skipped if they'd collide with the first/last edge labels.
+        let interior = Swift.min(3, points.count - 2)
+        guard interior > 0 else { return }
+        let leftLimit = rect.minX + firstSize.width + 6
+        let rightLimit = rect.maxX - lastSize.width - 6
+        for k in 1 ... interior {
+            let idx = k * (points.count - 1) / (interior + 1)
+            let str = NSAttributedString(string: points[idx].label, attributes: attrs)
+            let size = str.size()
+            let x = pointPosition(at: idx).x - size.width / 2
+            guard x >= leftLimit, x + size.width <= rightLimit else { continue }
+            str.draw(at: CGPoint(x: x, y: rect.minY - 14))
+        }
+    }
+
+    /// Compact value label for one point, matching the active metric.
+    private func valueText(at index: Int) -> String {
+        switch metric {
+        case .tokens: NumberFormatting.compactTokens(points[index].tokens)
+        case .cost: NumberFormatting.compactDollars(points[index].costUSD)
+        }
+    }
+
+    /// Draw value labels above data points. The trailing 7 points always show their value; on
+    /// hover, a ±20-point window around the cursor also labels up — a local readout rather than
+    /// cluttering the whole line. Labels are drawn left-to-right and skipped when they'd overlap
+    /// the previous one, so density stays readable.
+    private func drawPointValues(in _: CGContext, rect: NSRect) {
+        guard points.count > 1 else { return }
+        var indices = Set<Int>()
+        // Default: label just the trailing few non-zero points so the line isn't cluttered.
+        let trailing = 5
+        for i in Swift.max(0, points.count - trailing) ..< points.count where metricValue(at: i) > 0 {
+            indices.insert(i)
+        }
+        // On hover, add a ±5-point local window so you can read values around the cursor.
+        if let hoveredIndex {
+            let lo = Swift.max(0, hoveredIndex - 5)
+            let hi = Swift.min(points.count - 1, hoveredIndex + 5)
+            for i in lo ... hi where metricValue(at: i) > 0 {
+                indices.insert(i)
+            }
+        }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: Theme.numericFont(size: 9),
+            .foregroundColor: accentColor
+        ]
+        var lastMaxX = -CGFloat.greatestFiniteMagnitude
+        for index in indices.sorted() {
+            let pos = pointPosition(at: index)
+            let str = NSAttributedString(string: valueText(at: index), attributes: attrs)
+            let size = str.size()
+            let x = Swift.min(Swift.max(pos.x - size.width / 2, rect.minX), rect.maxX - size.width)
+            guard x > lastMaxX + 3 else { continue }
+            // Sit just above the dot; if that would clip at the top, drop below the dot instead.
+            let above = pos.y + 5
+            let y = above + size.height <= rect.maxY ? above : Swift.max(pos.y - size.height - 5, rect.minY)
+            str.draw(at: CGPoint(x: x, y: y))
+            lastMaxX = x + size.width
+        }
     }
 
     private func drawLine(in ctx: CGContext, rect: NSRect) {
